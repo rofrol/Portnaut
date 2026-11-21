@@ -238,9 +238,10 @@ final class AppModel: ObservableObject {
             return library.bottles.isEmpty ? "Portnaut is ready. Create a bottle for your first launcher or game." : "Portnaut is up to date. Your bottles, games and sign-ins were kept."
         }
     }
-    func createBottle(name: String, launcher: Launcher?, renderer: Renderer, windowsVersion: WindowsVersion, easyMode: Bool) {
+    func createBottle(name: String, launcher: Launcher?, renderer: Renderer, engineProfile: EngineProfile?, windowsVersion: WindowsVersion, easyMode: Bool) {
         perform("Creating \(name)…") { [self] in
-            let bottle = try await service.createBottle(name: name, launcher: launcher, renderer: renderer, windowsVersion: windowsVersion, easyMode: easyMode)
+            let bottle = try await service.createBottle(name: name, launcher: launcher, renderer: renderer, engineProfile: engineProfile,
+                                                        windowsVersion: windowsVersion, easyMode: easyMode)
             selectedBottleID = bottle.id
             page = .bottles
             return launcher.map { "\(bottle.name) is ready. Next, install \($0.title)." } ?? "\(bottle.name) is ready. Add a game or run an installer in it."

@@ -202,6 +202,26 @@ struct EngineProfileTests {
 
     func contents(_ url: URL) -> String? { (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) } }
 
+    /// A bottle created with the profile is set up on it: saved with it, its system32 holding the profile's files.
+    @Test func aBottleCreatedOnTheProfileStartsOnIt() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        // What wineboot would create; the fake Wine only exits.
+        let planned = service.paths.bottle(Bottle(id: "rockstar-games-launcher", name: "Rockstar Games Launcher", renderer: .dxmt))
+        try FileManager.default.createDirectory(at: planned.prefix.appendingPathComponent("dosdevices"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: planned.drive.appendingPathComponent("windows/system32"), withIntermediateDirectories: true)
+        let bottle = try await service.createBottle(name: "Rockstar Games Launcher", launcher: .rockstar, renderer: .dxmt, engineProfile: .gta5Enhanced)
+        #expect(bottle.id == "rockstar-games-launcher")
+        #expect(try service.bottle(bottle.id).engineProfile == .gta5Enhanced)
+        let system32 = service.paths.bottle(bottle).drive.appendingPathComponent("windows/system32")
+        #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
+        #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
+    }
+
     /// Entering keeps system32's originals once; a re-apply, or a repeated entry after a switch that did not
     /// finish, keeps them; leaving puts them back (repeatably) and removes what the bottle did not have.
     @Test func leavingTheProfilePutsSystem32Back() throws {

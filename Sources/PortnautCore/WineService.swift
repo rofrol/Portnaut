@@ -468,10 +468,13 @@ public final class WineService: @unchecked Sendable {
 
     // MARK: - Bottles
 
-    public func createBottle(name: String, launcher: Launcher?, renderer: Renderer, windowsVersion: WindowsVersion = .win10, easyMode: Bool = true) async throws -> Bottle {
+    /// A bottle given an engine profile is set up on it from the start (prepareBottle builds the profile first).
+    public func createBottle(name: String, launcher: Launcher?, renderer: Renderer, engineProfile: EngineProfile? = nil,
+                             windowsVersion: WindowsVersion = .win10, easyMode: Bool = true) async throws -> Bottle {
         guard paths.runtimeReady else { throw PortnautError("Prepare Portnaut first.") }
         var library = try paths.loadLibrary()
         var bottle = Bottle(id: library.newBottleID(for: name), name: name, launcher: launcher, renderer: renderer)
+        bottle.engineProfile = engineProfile
         bottle.windowsVersion = windowsVersion
         bottle.easyMode = easyMode
         bottle.autoBackupSaves = easyMode

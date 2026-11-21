@@ -379,8 +379,12 @@ final class NewBottleDraft: ObservableObject {
         var recommendation: Recommendation { launcher?.recommendation ?? GraphicsAdvisor.recommendation(for: Bottle(id: "", name: "", renderer: .dxmt), analyses: []) }
         var defaultName: String { launcher?.title ?? "Games" }
     }
-    /// Choosing a type resets the name and renderer to that type's defaults.
-    @Published var kind = Kind.launcher(.ubisoft) { didSet { name = kind.defaultName; renderer = kind.recommendation.renderer } }
+    /// Choosing a type resets the name, renderer and engine to that type's defaults.
+    @Published var kind = Kind.launcher(.ubisoft) {
+        didSet { name = kind.defaultName; renderer = kind.recommendation.renderer; engineProfile = kind.launcher?.engineProfile }
+    }
+    /// A Rockstar Games Launcher bottle starts on the GTA V Enhanced engine profile unless Portnaut's Wine is chosen.
+    @Published var engineProfile = Kind.launcher(.ubisoft).launcher?.engineProfile
     @Published var name = Kind.launcher(.ubisoft).defaultName
     @Published var renderer = Kind.launcher(.ubisoft).recommendation.renderer
     @Published var windows = WindowsVersion.win10
@@ -414,18 +418,32 @@ struct NewBottleSheet: View {
             }
             TextField("Name", text: $draft.name).textFieldStyle(.roundedBorder)
             VStack(alignment: .leading, spacing: 8) {
-                Picker("Renderer", selection: $draft.renderer) { ForEach(Renderer.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented)
-                Text("Recommended: \(draft.kind.recommendation.renderer.title). \(draft.kind.recommendation.reason)").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                if let note = draft.renderer.licenseNote { Text(note).font(.system(size: 11)).foregroundStyle(Palette.accent).fixedSize(horizontal: false, vertical: true) }
+                if let profile = draft.kind.launcher?.engineProfile {
+                    Picker("Engine", selection: $draft.engineProfile) {
+                        Text(profile.title).tag(EngineProfile?.some(profile))
+                        Text("Portnaut’s Wine").tag(EngineProfile?.none)
+                    }.frame(maxWidth: 420)
+                }
+                if let profile = draft.engineProfile {
+                    Text("\(profile.recommendationReason) It is downloaded while the bottle is created.").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    Text(profile.licenseNote).font(.system(size: 11)).foregroundStyle(Palette.accent).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Picker("Renderer", selection: $draft.renderer) { ForEach(Renderer.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented)
+                    Text("Recommended: \(draft.kind.recommendation.renderer.title). \(draft.kind.recommendation.reason)").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    if let note = draft.renderer.licenseNote { Text(note).font(.system(size: 11)).foregroundStyle(Palette.accent).fixedSize(horizontal: false, vertical: true) }
+                }
             }
             Picker("Windows version", selection: $draft.windows) { ForEach(WindowsVersion.allCases) { Text($0.title).tag($0) } }.frame(maxWidth: 300)
-            Toggle("Easy mode: choose the renderer for each game, and back up saves before each game", isOn: $draft.easyMode).toggleStyle(.switch)
+            // A profile bottle has no renderer to choose, so easy mode only backs up saves there.
+            Toggle(draft.engineProfile == nil ? "Easy mode: choose the renderer for each game, and back up saves before each game" : "Easy mode: back up saves before each game",
+                   isOn: $draft.easyMode).toggleStyle(.switch)
             Text("The renderer, Windows version and other settings can be changed later in the bottle’s settings.").font(.system(size: 11)).foregroundStyle(Palette.muted)
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Create") {
-                    model.createBottle(name: name, launcher: draft.kind.launcher, renderer: draft.renderer, windowsVersion: draft.windows, easyMode: draft.easyMode)
+                    model.createBottle(name: name, launcher: draft.kind.launcher, renderer: draft.renderer, engineProfile: draft.engineProfile,
+                                      windowsVersion: draft.windows, easyMode: draft.easyMode)
                     dismiss()
                 }.keyboardShortcut(.defaultAction).disabled(name.isEmpty || model.busy)
             }
