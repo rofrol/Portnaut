@@ -95,9 +95,17 @@ struct BottleDetail: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 SectionTitle(title: "Graphics", symbol: "cpu")
+                Picker("Engine", selection: binding(\.engineProfile, fallback: bottle)) {
+                    Text("Portnaut’s Wine").tag(EngineProfile?.none)
+                    ForEach(EngineProfile.allCases) { Text($0.title).tag(EngineProfile?.some($0)) }
+                }.frame(maxWidth: 420).disabled(running || model.busy)
+                if let profile = bottle.engineProfile {
+                    Text(profile.detail).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    Text(profile.licenseNote).font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                }
                 Picker("Renderer", selection: binding(\.renderer, fallback: bottle)) {
                     ForEach(Renderer.allCases) { Text($0.title).tag($0) }
-                }.pickerStyle(.segmented).labelsHidden().disabled(running || model.busy)
+                }.pickerStyle(.segmented).labelsHidden().disabled(running || model.busy || bottle.engineProfile != nil)
                 Text(bottle.renderer.detail).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
                 if let recommendation {
                     HStack(alignment: .top, spacing: 10) {

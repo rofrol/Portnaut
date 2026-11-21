@@ -37,6 +37,19 @@ public final class WineService: @unchecked Sendable {
             !key.hasPrefix("WINE") && !key.hasPrefix("CX_") && !key.hasPrefix("DYLD_") && !key.hasPrefix("DXMT_")
                 && !key.hasPrefix("DXVK_") && !key.hasPrefix("D3DM_") && !key.hasPrefix("PORTNAUT_")
         }
+        if let profile = bottle.engineProfile {
+            env = profile.environment(base: env, layout: paths.profile(profile), prefix: paths.bottle(bottle).prefix, bottle: bottle, cache: paths.cache)
+        } else {
+            env = rendererEnvironment(for: bottle, base: env)
+        }
+        // The user's own variables last, so they can adjust Portnaut's (not the ones that keep the bottle apart).
+        for (key, value) in bottle.environment.merging(game?.environment ?? [:], uniquingKeysWith: { $1 }) where EnvironmentPolicy.allows(key) { env[key] = value }
+        return env
+    }
+
+    /// Portnaut's runtime with the bottle's renderer.
+    private func rendererEnvironment(for bottle: Bottle, base: [String: String]) -> [String: String] {
+        var env = base
         let engine = paths.engine(for: bottle.renderer)
         env["PATH"] = engine.appendingPathComponent("bin").path + ":/usr/bin:/bin:/usr/sbin:/sbin"
         env["WINEPREFIX"] = paths.bottle(bottle).prefix.path
@@ -73,8 +86,6 @@ public final class WineService: @unchecked Sendable {
         if bottle.dlssActive { env[bottle.renderer == .dxmt ? "DXMT_ENABLE_NVEXT" : "D3DM_ENABLE_METALFX"] = "1" }
         // Rosetta on macOS 15 and later translates AVX and AVX2, but reports them only when asked.
         if bottle.options.advertiseAVX { env["ROSETTA_ADVERTISE_AVX"] = "1" }
-        // The user's own variables last, so they can adjust Portnaut's (not the ones that keep the bottle apart).
-        for (key, value) in bottle.environment.merging(game?.environment ?? [:], uniquingKeysWith: { $1 }) where EnvironmentPolicy.allows(key) { env[key] = value }
         return env
     }
 
@@ -112,20 +123,95 @@ public final class WineService: @unchecked Sendable {
     /// A part's archive in Downloads, reusing a verified copy, including one under the names Portnaut
     /// used before component updates.
     private func obtain(_ release: ComponentRelease) async throws -> URL {
+        try await obtain(release.url, fileName: release.fileName, sha256: release.sha256, size: release.size,
+                         legacy: ["highball-wine.tar.gz", "highball-dxmt.tar.gz", "highball-runtime.tar.xz"])
+    }
+    /// A pinned file in Downloads, reusing a verified copy (also under one of the `legacy` names).
+    private func obtain(_ url: URL, fileName: String, sha256: String, size: Int64?, legacy: [String] = []) async throws -> URL {
         let fm = FileManager.default
-        let destination = paths.cache.appendingPathComponent(release.fileName)
-        let legacy = ["highball-wine.tar.gz", "highball-dxmt.tar.gz", "highball-runtime.tar.xz"].map { paths.cache.appendingPathComponent($0) }
-        for candidate in [destination] + legacy where fm.fileExists(atPath: candidate.path) {
-            let size = (try? fm.attributesOfItem(atPath: candidate.path)[.size] as? NSNumber)?.int64Value
-            if let expected = release.size, size != expected { continue }
-            if (try? FileIntegrity.verify(candidate, expected: release.sha256)) != nil { return candidate }
+        let destination = paths.cache.appendingPathComponent(fileName)
+        for candidate in [destination] + legacy.map({ paths.cache.appendingPathComponent($0) }) where fm.fileExists(atPath: candidate.path) {
+            let found = (try? fm.attributesOfItem(atPath: candidate.path)[.size] as? NSNumber)?.int64Value
+            if let size, found != size { continue }
+            if (try? FileIntegrity.verify(candidate, expected: sha256)) != nil { return candidate }
         }
-        do { try await download(release.url, to: destination) }
+        do { try await download(url, to: destination) }
         catch let error as PortnautError { throw error }
-        catch { throw PortnautError("Couldn’t download \(release.fileName): \(error.localizedDescription)") }
-        do { try FileIntegrity.verify(destination, expected: release.sha256) }
+        catch { throw PortnautError("Couldn’t download \(fileName): \(error.localizedDescription)") }
+        do { try FileIntegrity.verify(destination, expected: sha256) }
         catch { try? fm.removeItem(at: destination); throw error }
         return destination
+    }
+
+    /// Builds an engine profile when it is missing or was built from other files: its downloads checked,
+    /// unpacked in a staging folder, the engine overlaid and linked to its libraries, then moved into place.
+    /// The unpacking tools and Wine's version check run until they exit.
+    public func prepareProfile(_ profile: EngineProfile, progress: @escaping @Sendable (SetupProgress) async -> Void = { _ in }) async throws {
+        guard !paths.profileReady(profile) else { return }
+        guard Self.rosettaInstalled else { throw PortnautError(Self.rosettaMissing) }
+        try paths.createDirectories()
+        let fm = FileManager.default
+        let layout = paths.profile(profile)
+        try fm.createDirectory(at: layout.root.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let available = (try fm.attributesOfFileSystem(forPath: paths.root.path)[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+        guard available > 2_000_000_000 else { throw PortnautError("Free at least 2 GB to prepare \(profile.title).") }
+        var archives: [String: URL] = [:]
+        for (index, item) in profile.downloads.enumerated() {
+            await progress(SetupProgress(0.05 + 0.5 * Double(index) / Double(profile.downloads.count), "Downloading \(item.fileName)"))
+            archives[item.fileName] = try await obtain(item.url, fileName: item.fileName, sha256: item.sha256, size: item.size)
+        }
+        await progress(SetupProgress(0.6, "Installing \(profile.title)"))
+        let stage = layout.root.deletingLastPathComponent().appendingPathComponent(".staging-" + UUID().uuidString)
+        try fm.createDirectory(at: stage, withIntermediateDirectories: true)
+        do {
+            let tar = URL(fileURLWithPath: "/usr/bin/tar")
+            let sources = stage.appendingPathComponent(".sources")
+            let staged = EngineProfile.Layout(root: stage)
+            try fm.createDirectory(at: sources, withIntermediateDirectories: true)
+            func unpack(_ fileName: String, into folder: URL, _ members: [String] = []) async throws {
+                guard let archive = archives[fileName] else { throw PortnautError("\(profile.title) lacks \(fileName).") }
+                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+                try await ProcessRunner.run(tar, ["-xf", archive.path, "-C", folder.path] + members, log: paths.setupLog, timeout: nil)
+            }
+            try await unpack(profile.engineArchive, into: sources, [EngineProfile.macGamesApp + "/Engine", EngineProfile.macGamesApp + "/dependency-links.json"])
+            try fm.moveItem(at: sources.appendingPathComponent(EngineProfile.macGamesApp + "/Engine"), to: staged.engine)
+            try await unpack(profile.templateArchive, into: sources, [EngineProfile.templateApp])
+            try fm.createDirectory(at: staged.frameworks.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: sources.appendingPathComponent(EngineProfile.templateApp), to: staged.frameworks)
+            for pack in profile.packs {
+                try await unpack("macgames-pack-\(pack).tar.xz", into: stage.appendingPathComponent("packs"))
+                guard fm.fileExists(atPath: staged.pack(pack).path) else { throw PortnautError("The \(pack) pack has an unexpected layout.") }
+            }
+            for overlay in profile.overlays {
+                let folder = profile.packs.lazy.map { staged.pack($0).appendingPathComponent("Overlays/\(overlay)") }.first { fm.fileExists(atPath: $0.path) }
+                guard let folder else { throw PortnautError("\(profile.title) lacks the \(overlay) overlay.") }
+                try await ProcessRunner.run(URL(fileURLWithPath: "/usr/bin/ditto"), ["--noextattr", "--norsrc", folder.path, staged.engine.path], log: paths.setupLog, timeout: nil)
+            }
+            // The engine reaches its libraries and D3DMetal through these links; a file an overlay ships stays.
+            let links = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: sources.appendingPathComponent(EngineProfile.macGamesApp + "/dependency-links.json")))
+            for (relative, target) in links.sorted(by: { $0.key < $1.key }) {
+                let link = staged.engine.appendingPathComponent(relative)
+                if fm.fileExists(atPath: link.path) || (try? fm.destinationOfSymbolicLink(atPath: link.path)) != nil { continue }
+                let destination = EngineProfile.linkTarget(target) { fm.fileExists(atPath: staged.d3dmetal.appendingPathComponent($0).path) }
+                guard fm.fileExists(atPath: stage.appendingPathComponent(destination).path) else { throw PortnautError("\(profile.title) lacks \(target).") }
+                try fm.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.createSymbolicLink(atPath: link.path, withDestinationPath: EngineProfile.relativeLink(from: "engine/" + relative, to: destination))
+            }
+            try fm.removeItem(at: sources)
+            try await ProcessRunner.run(staged.engine.appendingPathComponent("bin/wine"), ["--version"], log: paths.setupLog, timeout: nil)
+            try Data(profile.marker.utf8).write(to: staged.markerFile, options: .atomic)
+            // The profile it replaces goes aside first and comes back if the new one cannot move into place.
+            let old = layout.root.deletingLastPathComponent().appendingPathComponent(".old-" + UUID().uuidString)
+            let hadProfile = fm.fileExists(atPath: layout.root.path)
+            if hadProfile { try fm.moveItem(at: layout.root, to: old) }
+            do { try fm.moveItem(at: stage, to: layout.root) }
+            catch { if hadProfile { try? fm.moveItem(at: old, to: layout.root) }; throw error }
+            if hadProfile { try? fm.removeItem(at: old) }
+        } catch {
+            try? fm.removeItem(at: stage)
+            throw error
+        }
+        await progress(SetupProgress(1, "\(profile.title) is ready"))
     }
 
     /// Builds a runtime from a set of parts in a staging folder and returns it: one unmodified engine
@@ -248,7 +334,7 @@ public final class WineService: @unchecked Sendable {
         let fm = FileManager.default
         // End Windows programs still running from the runtime about to be replaced.
         for bottle in (try? paths.loadLibrary().bottles) ?? [] {
-            for wineserver in [paths.wineserver(for: bottle.renderer), paths.legacyRuntime.appendingPathComponent("engine/bin/wineserver")]
+            for wineserver in [paths.wineserver(for: bottle), paths.legacyRuntime.appendingPathComponent("engine/bin/wineserver")]
             where fm.isExecutableFile(atPath: wineserver.path) {
                 _ = try? await ProcessRunner.run(wineserver, ["-k"], environment: environment(for: bottle), log: paths.setupLog, timeout: 15, allowFailure: true)
             }
@@ -354,7 +440,9 @@ public final class WineService: @unchecked Sendable {
     /// Deletes downloaded component archives neither the current nor the previous runtime was built
     /// from. Portnaut's built-in archives (highball-*.tar.*) stay, for repairs.
     func pruneDownloads() {
+        // Engine profiles' archives stay too: the template's name matches the pattern below.
         let keep = Set([installedRuntime()?.set, previousRuntime()?.set].compactMap { $0 }.flatMap(\.components).map(\.fileName))
+            .union(EngineProfile.allCases.flatMap(\.downloads).map(\.fileName))
         let pattern = try! NSRegularExpression(pattern: #"^(engine-wine-.+\.tar\.gz|dxmt-highball-.+\.tar\.gz|Template-[\d.]+\.tar\.xz|moltenvk-.+\.tar\.gz|MoltenVK-macos\.tar|d3dmetal-.+\.tar\.xz)$"#)
         for name in (try? FileManager.default.contentsOfDirectory(atPath: paths.cache.path)) ?? []
         where !keep.contains(name) && pattern.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil {
@@ -403,23 +491,24 @@ public final class WineService: @unchecked Sendable {
         let bottlePaths = paths.bottle(bottle)
         let fm = FileManager.default
         let isNew = !bottlePaths.ready
+        if let profile = bottle.engineProfile { try await prepareProfile(profile) }
         if isNew {
             try fm.createDirectory(at: bottlePaths.prefix, withIntermediateDirectories: true)
             do {
-                try await ProcessRunner.run(paths.wine(for: bottle.renderer), ["wineboot", "-u"], environment: environment(for: bottle), log: paths.setupLog, timeout: 180)
+                try await ProcessRunner.run(paths.wine(for: bottle), ["wineboot", "-u"], environment: environment(for: bottle), log: paths.setupLog, timeout: 180)
                 try isolateUserFolders(bottlePaths)
             } catch {
                 try? await stop(bottle)
                 throw error
             }
         }
-        try mapRuntimeDrive(bottlePaths)
+        try mapRuntimeDrive(bottlePaths, to: bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
         try await applyProfile(bottle)
-        try await ProcessRunner.run(paths.wine(for: bottle.renderer), ["cmd", "/c", "ver"], environment: environment(for: bottle), directory: bottlePaths.drive, log: paths.setupLog, timeout: 30)
+        try await ProcessRunner.run(paths.wine(for: bottle), ["cmd", "/c", "ver"], environment: environment(for: bottle), directory: bottlePaths.drive, log: paths.setupLog, timeout: 30)
         // Wine writes system.reg when its server exits. A new environment has no programs of the
         // user's running, so wait for that; an existing one may be in use and is already written.
         if isNew {
-            _ = try? await ProcessRunner.run(paths.wineserver(for: bottle.renderer), ["-w"], environment: environment(for: bottle), log: paths.setupLog, timeout: 60, allowFailure: true)
+            _ = try? await ProcessRunner.run(paths.wineserver(for: bottle), ["-w"], environment: environment(for: bottle), log: paths.setupLog, timeout: 60, allowFailure: true)
         }
         try Data("portnaut-bottle-v1\n".utf8).write(to: bottlePaths.marker, options: .atomic)
     }
@@ -456,13 +545,14 @@ public final class WineService: @unchecked Sendable {
 
     /// Wine reaches its bundled Gecko (HTML) and Mono (.NET) through a Windows path to its own data
     /// folder. Without Z:, that path is "\\?\unix\…", which Wine's HTML engine shortens to "unix\…" and
-    /// rejects, so installers that show HTML asked to download Gecko. This drive exposes only Portnaut's runtime.
-    func mapRuntimeDrive(_ bottlePaths: BottlePaths) throws {
+    /// rejects, so installers that show HTML asked to download Gecko. This drive exposes only the bottle's
+    /// runtime: Portnaut's, or its engine profile's.
+    func mapRuntimeDrive(_ bottlePaths: BottlePaths, to runtime: URL) throws {
         let fm = FileManager.default
         let drive = bottlePaths.prefix.appendingPathComponent("dosdevices/\(Self.runtimeDrive):")
-        if (try? fm.destinationOfSymbolicLink(atPath: drive.path)) == paths.runtime.path { return }
+        if (try? fm.destinationOfSymbolicLink(atPath: drive.path)) == runtime.path { return }
         try? fm.removeItem(at: drive)
-        try fm.createSymbolicLink(at: drive, withDestinationURL: paths.runtime)
+        try fm.createSymbolicLink(at: drive, withDestinationURL: runtime)
     }
     static let runtimeDrive = "y"
 
@@ -490,6 +580,8 @@ public final class WineService: @unchecked Sendable {
             // Rockstar's games open the Rockstar Games Launcher from any store (GTA V and Red Dead
             // Redemption 2 bought on Steam or Epic too), so its Social Club window needs its fix everywhere.
             + (bottle.launcher == .rockstar ? "" : Launcher.rockstar.registry)
+            // Last, so the profile's per-program overrides replace a game's.
+            + (bottle.engineProfile?.registry ?? "")
     }
     /// Wine's controller driver reads these when a session starts.
     static func controllerRegistry(_ settings: ControllerSettings) -> String {
@@ -525,15 +617,47 @@ public final class WineService: @unchecked Sendable {
     public func applyProfile(_ bottle: Bottle) async throws {
         let directory = paths.bottle(bottle).drive.appendingPathComponent("Portnaut")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let profile = bottle.engineProfile { try applyFiles(of: profile, to: paths.bottle(bottle)) }
         try Data(Self.profile(for: bottle).utf8).write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
-        try await ProcessRunner.run(paths.wine(for: bottle.renderer), ["reg", "import", "C:\\Portnaut\\profile.reg"], environment: environment(for: bottle),
+        try await ProcessRunner.run(paths.wine(for: bottle), ["reg", "import", "C:\\Portnaut\\profile.reg"], environment: environment(for: bottle),
                                     directory: paths.bottle(bottle).drive, log: paths.setupLog, timeout: 30)
+    }
+
+    /// An engine profile's graphics libraries in system32 and the game's arguments in its commandline.txt.
+    func applyFiles(of profile: EngineProfile, to bottlePaths: BottlePaths) throws {
+        let fm = FileManager.default
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        for copy in profile.systemCopies(layout: paths.profile(profile)) {
+            let target = system32.appendingPathComponent(copy.name)
+            if (try? fm.destinationOfSymbolicLink(atPath: target.path)) != nil || fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
+            try fm.copyItem(at: copy.from, to: target)
+        }
+        try writeGameArguments(to: bottlePaths)
+    }
+    /// Adds the profile's game arguments to commandline.txt once the game is installed. Runs before every
+    /// program of a profile bottle, so a game the launcher installs later gets them too. A file that is not
+    /// UTF-8 is left as it is rather than lose the user's arguments.
+    func writeGameArguments(to bottlePaths: BottlePaths) throws {
+        let game = bottlePaths.drive.appendingPathComponent(EngineProfile.gameFolder)
+        guard FileManager.default.fileExists(atPath: game.path) else { return }
+        let file = game.appendingPathComponent("commandline.txt")
+        // A file that exists but cannot be read is left alone too.
+        let data: Data? = FileManager.default.fileExists(atPath: file.path) ? try Data(contentsOf: file) : nil
+        let current = data.map { String(decoding: $0, as: UTF8.self) }
+        if let data, current.map({ Data($0.utf8) }) != data { return }
+        let merged = EngineProfile.commandLine(merging: current)
+        if merged != current { try Data(merged.utf8).write(to: file, options: .atomic) }
     }
 
     /// Saves changed settings and applies the registry part, which takes effect for the next programs started.
     public func update(_ bottle: Bottle) async throws {
+        // A bottle switched to an engine profile gets it built (downloaded) before the switch is saved,
+        // so a failed download leaves the bottle as it was; then its drive Y: moves to the profile.
+        if let profile = bottle.engineProfile, paths.bottle(bottle).ready { try await prepareProfile(profile) }
         try save(bottle)
-        if paths.bottle(bottle).ready { try await applyProfile(bottle) }
+        guard paths.bottle(bottle).ready else { return }
+        try mapRuntimeDrive(paths.bottle(bottle), to: bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
+        try await applyProfile(bottle)
     }
 
     // MARK: - Launchers and games
@@ -588,13 +712,22 @@ public final class WineService: @unchecked Sendable {
         let status = try await run(executable, in: bottle, arguments: arguments, game: game, waitForSession: waitForSession)
         guard status == 0 else { throw PortnautError("The Windows program exited with code \(status). Open Diagnostics to inspect session.log.") }
     }
+    /// Checked before Portnaut starts a program in a bottle: the runtime, the bottle and its engine profile
+    /// are prepared, and a profile bottle's game has its arguments.
+    func requireEngine(of bottle: Bottle) throws {
+        guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
+        guard let profile = bottle.engineProfile else { return }
+        guard paths.profileReady(profile) else { throw PortnautError("\(profile.title) is not prepared. Choose Repair All Bottles in Setup to build it.") }
+        try writeGameArguments(to: paths.bottle(bottle))
+    }
+
     /// Runs a program of the bottle's drive and returns its exit code, by default after the whole session ends.
     @discardableResult
     func run(_ executable: URL, in bottle: Bottle, arguments: [String] = [], game: Game? = nil, waitForSession: Bool = true) async throws -> Int32 {
-        guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
+        try requireEngine(of: bottle)
         let winPath = try paths.bottle(bottle).windowsPath(executable)
         guard FileManager.default.fileExists(atPath: executable.path) else { throw PortnautError("The Windows program could not be found. Use Locate game or reinstall it.") }
-        let status = try await ProcessRunner.run(paths.wine(for: bottle.renderer), [winPath] + arguments, environment: environment(for: bottle, game: game),
+        let status = try await ProcessRunner.run(paths.wine(for: bottle), [winPath] + arguments, environment: environment(for: bottle, game: game),
                                                  directory: executable.deletingLastPathComponent(), log: paths.sessionLog, timeout: nil, allowFailure: true)
         // A launcher can exit while its child is still running. Track the entire prefix.
         if waitForSession { try await waitForSessionEnd(bottle) }
@@ -673,9 +806,14 @@ public final class WineService: @unchecked Sendable {
         if waitForSession {
             bottle = try self.bottle(bottle.id)
             game = bottle.games.first { $0.id == game.id } ?? game
+            // A profile bottle has no renderers to compare, so no best-setup round either.
+            if bottle.engineProfile != nil { game.setupTrial = nil }
             // A best-setup round plays on its renderer, recorded; otherwise easy mode chooses.
             let target: Renderer?
-            if let round = game.setupTrial?.next {
+            if bottle.engineProfile != nil {
+                // The profile's engine replaces the renderer, so there is none to choose.
+                target = nil
+            } else if let round = game.setupTrial?.next {
                 target = round
             } else if bottle.easyMode {
                 target = easyModeChoice(for: game, in: bottle, report: compatibilityReport(for: game, in: bottle, database: compatibility ?? compatibilityDatabase()))?.renderer
@@ -725,11 +863,11 @@ public final class WineService: @unchecked Sendable {
     }
     public func waitForSessionEnd(_ bottle: Bottle) async throws {
         guard paths.runtimeReady else { return }
-        try await ProcessRunner.run(paths.wineserver(for: bottle.renderer), ["-w"], environment: environment(for: bottle), log: paths.sessionLog, timeout: nil)
+        try await ProcessRunner.run(paths.wineserver(for: bottle), ["-w"], environment: environment(for: bottle), log: paths.sessionLog, timeout: nil)
     }
     public func stop(_ bottle: Bottle) async throws {
         guard paths.runtimeReady else { return }
-        try await ProcessRunner.run(paths.wineserver(for: bottle.renderer), ["-k"], environment: environment(for: bottle), log: paths.sessionLog, timeout: 15)
+        try await ProcessRunner.run(paths.wineserver(for: bottle), ["-k"], environment: environment(for: bottle), log: paths.sessionLog, timeout: 15)
     }
 
     /// Adds a program inside the bottle as a game, named after a known title or its file.
@@ -780,8 +918,8 @@ public final class WineService: @unchecked Sendable {
 
     /// Wine's Game Controllers panel, which lists and tests controllers as Windows programs see them.
     public func openControllerPanel(_ bottle: Bottle, waitForSession: Bool = true) async throws {
-        guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
-        try await ProcessRunner.run(paths.wine(for: bottle.renderer), ["control", "joy.cpl"], environment: environment(for: bottle),
+        try requireEngine(of: bottle)
+        try await ProcessRunner.run(paths.wine(for: bottle), ["control", "joy.cpl"], environment: environment(for: bottle),
                                     directory: paths.bottle(bottle).drive, log: paths.sessionLog, timeout: nil, allowFailure: true)
         if waitForSession { try await waitForSessionEnd(bottle) }
     }
@@ -889,7 +1027,7 @@ public final class WineService: @unchecked Sendable {
     /// it added. With `waitForSession` false, as when the bottle's launcher is open, Portnaut waits
     /// only for the installer's own process.
     public func runInstaller(_ file: URL, in bottle: Bottle, arguments: [String] = [], waitForSession: Bool = true) async throws -> [DetectedProgram] {
-        guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
+        try requireEngine(of: bottle)
         let kind = file.pathExtension.lowercased()
         guard kind == "msi" || (kind == "exe" && (try? PEImage.wineArchitecture(of: file)) != nil) else {
             throw PortnautError("\(file.lastPathComponent) is not a Windows installer. Choose an .exe or .msi file.")
@@ -902,7 +1040,7 @@ public final class WineService: @unchecked Sendable {
         try fm.createSymbolicLink(at: drive, withDestinationURL: file.deletingLastPathComponent())
         defer { try? fm.removeItem(at: drive) }
         let windowsFile = "\(Self.installerDrive.uppercased()):\\\(file.lastPathComponent)"
-        let status = try await ProcessRunner.run(paths.wine(for: bottle.renderer), (kind == "msi" ? ["msiexec", "/i", windowsFile] : [windowsFile]) + arguments,
+        let status = try await ProcessRunner.run(paths.wine(for: bottle), (kind == "msi" ? ["msiexec", "/i", windowsFile] : [windowsFile]) + arguments,
                                                  environment: environment(for: bottle), directory: file.deletingLastPathComponent(),
                                                  log: paths.sessionLog, timeout: nil, allowFailure: true)
         if waitForSession { try await waitForSessionEnd(bottle) }

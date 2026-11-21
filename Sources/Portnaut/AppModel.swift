@@ -247,8 +247,8 @@ final class AppModel: ObservableObject {
     /// Saves a changed bottle; the registry part applies to programs started afterwards.
     func save(_ bottle: Bottle) {
         guard let old = library.bottle(bottle.id), old != bottle else { return }
-        if old.renderer != bottle.renderer, sessionActive(bottle) {
-            error = "Stop \(bottle.name)’s Windows session before switching its renderer."
+        if old.renderer != bottle.renderer || old.engineProfile != bottle.engineProfile, sessionActive(bottle) {
+            error = "Stop \(bottle.name)’s Windows session before switching its renderer or engine."
             return
         }
         library.update(bottle)
@@ -326,7 +326,7 @@ final class AppModel: ObservableObject {
         var status = "Starting \(entry.game.name)…"
         if let trial = entry.game.setupTrial, let round = trial.next {
             status = "Best setup, round \(trial.round) of \(trial.renderers.count): starting \(entry.game.name) on \(round.title)…"
-        } else if entry.bottle.easyMode, let choice = service.easyModeChoice(for: entry.game, in: entry.bottle, report: reports[entry.id]), choice.renderer != entry.bottle.renderer {
+        } else if entry.bottle.easyMode, entry.bottle.engineProfile == nil, let choice = service.easyModeChoice(for: entry.game, in: entry.bottle, report: reports[entry.id]), choice.renderer != entry.bottle.renderer {
             status = "Switching \(entry.bottle.name) to \(choice.renderer.title) for \(entry.game.name), then starting it…"
         }
         if entry.game.setupTrial?.next != nil { roundSessions.insert(entry.bottle.id) }

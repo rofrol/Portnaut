@@ -13,6 +13,8 @@ struct PortnautDoctor {
       analyze <path/to/program.exe>           graphics APIs and the recommended renderer
       create <name> [launcher] [renderer]     new bottle; launcher: \(Launcher.allCases.map(\.rawValue).joined(separator: "|")); renderer: \(Renderer.allCases.map(\.rawValue).joined(separator: "|"))
       renderer [bottle] <renderer>            switch a bottle's renderer
+      prepare-engine <profile>                download, check and build an engine profile
+      engine [bottle] <profile>|off           replace the bottle's Wine and renderer with an engine profile: \(EngineProfile.allCases.map(\.rawValue).joined(separator: "|"))
       add-game [bottle] <path/to/program.exe> add a program inside the bottle as a game
       import [bottle] <folder>                copy an Assassin's Creed III installation into the bottle
       install <bottle> <installer.exe|.msi> [arguments…]  run an installer from the Mac, list the programs it added
@@ -79,6 +81,17 @@ struct PortnautDoctor {
                 bottle.renderer = renderer
                 try await service.update(bottle)
                 print("\(bottle.name): \(renderer.title)")
+            case "prepare-engine":
+                guard let value = arguments.first, let profile = EngineProfile(rawValue: value) else { throw PortnautError(usage) }
+                try await service.prepareProfile(profile) { print("\(Int($0.fraction * 100))% \($0.message)") }
+                print("\(profile.title): \(service.paths.profile(profile).root.path)")
+            case "engine":
+                guard let value = arguments.last, value == "off" || EngineProfile(rawValue: value) != nil else { throw PortnautError(usage) }
+                var bottle = try target(service, arguments.dropLast())
+                try? await service.stop(bottle)
+                bottle.engineProfile = EngineProfile(rawValue: value)
+                try await service.update(bottle)
+                print("\(bottle.name): \(bottle.engineProfile?.title ?? "Portnaut’s Wine")")
             case "add-game":
                 guard let path = arguments.last else { throw PortnautError(usage) }
                 let game = try service.addGame(URL(fileURLWithPath: path), to: try target(service, arguments.dropLast()))
@@ -115,12 +128,12 @@ struct PortnautDoctor {
                 for (key, value) in service.environment(for: bottle).sorted(by: { $0.key < $1.key }) where key.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) {
                     print("export \(key)='\(value.replacingOccurrences(of: "'", with: "'\\''"))'")
                 }
-                print("# wine: \(service.paths.wine(for: bottle.renderer).path)")
+                print("# wine: \(service.paths.wine(for: bottle).path)")
             case "run":
                 // run <bottle> <program> [arguments…]: a Windows program by name or C:\ path.
                 guard arguments.count >= 2 else { throw PortnautError(usage) }
                 let bottle = try service.bottle(arguments[0])
-                let status = try await ProcessRunner.run(service.paths.wine(for: bottle.renderer), Array(arguments.dropFirst()), environment: service.environment(for: bottle),
+                let status = try await ProcessRunner.run(service.paths.wine(for: bottle), Array(arguments.dropFirst()), environment: service.environment(for: bottle),
                                                          directory: service.paths.bottle(bottle).drive, log: service.paths.sessionLog, timeout: 120, allowFailure: true)
                 try await service.waitForSessionEnd(bottle)
                 print("Exit code \(status); output is in \(service.paths.sessionLog.path)")
