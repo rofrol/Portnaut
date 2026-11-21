@@ -662,6 +662,12 @@ public final class WineService: @unchecked Sendable {
         if try await serverRunning(for: bottle) {
             throw PortnautError("Quit the Windows programs running in \(bottle.name) first, then try again.")
         }
+        // The files come from the profile build this Portnaut expects, recorded with its marker; checked before
+        // anything changes, though every caller prepared or checked the profile already.
+        if let target, !paths.profileReady(target) {
+            throw PortnautError("\(target.title) is not prepared. Choose Repair All Bottles in Setup to build it.")
+        }
+        let marker = target.map(\.marker)
         // A prefix set up before records existed holds the profile whose backup is there (at most one then, as
         // EngineProfile had one case). Migration for the gta5-enhanced bottle, recordless when records came;
         // remove it once no recordless prefix is left.
@@ -695,18 +701,19 @@ public final class WineService: @unchecked Sendable {
             }
         }
         if saving { try save(bottle) }
-        try writeEngineState(.applied(target), in: bottlePaths)
+        try writeEngineState(.applied(target, marker: marker), in: bottlePaths)
         if let leaving { try discardBackup(of: leaving, in: bottlePaths) }
     }
 
     static let engineStampValue = "EngineStamp"
 
-    /// Whether the record says the bottle's engine is applied and drive Y: points at that engine.
+    /// Whether the record says the bottle's engine is applied, from its profile's current build, and drive Y:
+    /// points at that engine.
     func engineInPlace(for bottle: Bottle) throws -> Bool {
         let bottlePaths = paths.bottle(bottle)
         let driveY = try? FileManager.default.destinationOfSymbolicLink(atPath: bottlePaths.prefix.appendingPathComponent("dosdevices/\(Self.runtimeDrive):").path)
         let engine = bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime
-        return try engineState(in: bottlePaths) == .applied(bottle.engineProfile) && driveY == engine.path
+        return try engineState(in: bottlePaths) == .applied(bottle.engineProfile, marker: bottle.engineProfile?.marker) && driveY == engine.path
     }
 
     /// Whether a Wine server runs for the bottle's prefix. `wineserver -k0` sends signal 0 to the server holding

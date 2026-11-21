@@ -237,8 +237,9 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
 /// WineService.applyEngine, which marks a change before it touches the prefix and records the result after.
 enum EngineState: Equatable, Codable {
     /// Drive Y:, system32 and the registry are on this engine (nil: Portnaut's runtime); a profile's backup
-    /// holds the system32 files it replaced.
-    case applied(EngineProfile?)
+    /// holds the system32 files it replaced. `marker` is the profile build's marker its files were copied from
+    /// (nil for the runtime, and in records written before markers were kept), so a rebuilt profile is applied again.
+    case applied(EngineProfile?, marker: String?)
     /// A change began and did not finish: the prefix may be anywhere between engines. `holding`'s files may be
     /// in system32 and its values in the registry, and its backup, when there is one, holds the originals.
     case changing(holding: EngineProfile?)
@@ -246,26 +247,33 @@ enum EngineState: Equatable, Codable {
     /// The profile whose backup holds the originals.
     var held: EngineProfile? {
         switch self {
-        case .applied(let profile): profile
+        case .applied(let profile, _): profile
         case .changing(let holding): holding
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case state, profile }
+    private enum CodingKeys: String, CodingKey { case state, profile, marker }
     private enum Kind: String, Codable { case applied, changing }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let profile = try container.decodeIfPresent(EngineProfile.self, forKey: .profile)
         switch try container.decode(Kind.self, forKey: .state) {
-        case .applied: self = .applied(profile)
+        case .applied: self = .applied(profile, marker: try container.decodeIfPresent(String.self, forKey: .marker))
         case .changing: self = .changing(holding: profile)
         }
     }
 
     func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(self == .applied(held) ? Kind.applied : Kind.changing, forKey: .state)
-        try container.encodeIfPresent(held, forKey: .profile)
+        switch self {
+        case .applied(let profile, let marker):
+            try container.encode(Kind.applied, forKey: .state)
+            try container.encodeIfPresent(profile, forKey: .profile)
+            try container.encodeIfPresent(marker, forKey: .marker)
+        case .changing(let holding):
+            try container.encode(Kind.changing, forKey: .state)
+            try container.encodeIfPresent(holding, forKey: .profile)
+        }
     }
 }

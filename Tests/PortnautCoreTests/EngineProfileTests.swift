@@ -435,7 +435,7 @@ struct EngineProfileTests {
         try fakeWine(profileServer)
         try await service.update(bottle)
         #expect(try service.bottle(bottle.id).engineProfile == .gta5Enhanced)
-        #expect(try service.engineState(in: bottlePaths) == .applied(.gta5Enhanced))
+        #expect(try service.engineState(in: bottlePaths) == .applied(.gta5Enhanced, marker: EngineProfile.gta5Enhanced.marker))
     }
 
     /// An engine change while a Wine server runs in the prefix is refused before it touches anything; a settings
@@ -448,7 +448,7 @@ struct EngineProfileTests {
         bottle.engineProfile = nil
         let bottlePaths = try readyBottle(bottle, in: service)
         try await service.update(bottle)
-        #expect(try service.engineState(in: bottlePaths) == .applied(nil))
+        #expect(try service.engineState(in: bottlePaths) == .applied(nil, marker: nil))
         let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
         var switched = bottle
         switched.engineProfile = .gta5Enhanced
@@ -457,7 +457,7 @@ struct EngineProfileTests {
             for renderer in Renderer.allCases { try fakeWine(service.paths.wineserver(for: renderer), probeStatus: status) }
             try fakeWine(service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wineserver"), probeStatus: status)
             await #expect(throws: (any Error).self) { try await service.update(switched) }
-            #expect(try service.engineState(in: bottlePaths) == .applied(nil))
+            #expect(try service.engineState(in: bottlePaths) == .applied(nil, marker: nil))
             #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent("d3d12.dll").path))
             #expect(try service.bottle(bottle.id).engineProfile == nil)
         }
@@ -587,6 +587,47 @@ struct EngineProfileTests {
         try service.mapRuntimeDrive(bottlePaths, to: root.appendingPathComponent("elsewhere"))
         try await service.launch(program, in: bottle, waitForSession: false)
         try expectOnEngine(.gta5Enhanced, service, bottlePaths)
+    }
+
+    /// A bottle whose files came from an earlier build of its profile (a record with another marker, or one
+    /// written before records kept markers) gets the current build's files at its next start, recorded with
+    /// that build's marker only once its registry is on disk.
+    @Test(arguments: [nil, "gta5-enhanced-v2:old"] as [String?])
+    func aStartAfterAProfileRebuildCopiesItsFilesAgain(oldMarker: String?) async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        let bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let program = bottlePaths.drive.appendingPathComponent("game.exe")
+        try Data().write(to: program)
+        try await service.update(bottle)
+        let d3d12 = bottlePaths.drive.appendingPathComponent("windows/system32/d3d12.dll")
+        // The bottle as the earlier build left it: its d3d12 and its record.
+        try Data("earlier build".utf8).write(to: d3d12)
+        let old = try #require(String(data: JSONEncoder().encode(EngineState.applied(.gta5Enhanced, marker: oldMarker)), encoding: .utf8))
+        if oldMarker == nil { #expect(!old.contains("marker")) }
+        try Data(old.utf8).write(to: service.engineStateFile(in: bottlePaths))
+        #expect(try !service.engineInPlace(for: bottle))
+        let profileServer = service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wineserver")
+        try fakeWine(profileServer, savedHives: [])
+        await #expect(throws: PortnautError.self) { try await service.launch(program, in: bottle, waitForSession: false) }
+        #expect(try service.engineState(in: bottlePaths) == .changing(holding: .gta5Enhanced))
+        #expect(contents(d3d12)?.hasPrefix("profile:") == true)
+        // The repeat copies the files again, whatever the failed attempt left.
+        try Data("earlier build".utf8).write(to: d3d12)
+        try fakeWine(profileServer)
+        try await service.launch(program, in: bottle, waitForSession: false)
+        #expect(contents(d3d12)?.hasPrefix("profile:") == true)
+        // The originals kept when the bottle first entered the profile stay the originals.
+        let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(backup.appendingPathComponent(name)) == "original:\(name)") }
+        #expect(!FileManager.default.fileExists(atPath: backup.appendingPathComponent("d3d12.dll").path))
+        #expect(try service.engineState(in: bottlePaths) == .applied(.gta5Enhanced, marker: EngineProfile.gta5Enhanced.marker))
+        #expect(try service.engineInPlace(for: bottle))
     }
 
     /// Every value the profile writes is removed by its cleanup, which comes before the bottle's own values.
