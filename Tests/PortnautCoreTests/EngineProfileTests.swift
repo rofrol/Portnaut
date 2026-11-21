@@ -177,11 +177,13 @@ struct EngineProfileTests {
         try service.paths.createDirectories()
         return (root, service)
     }
-    func fakeWine(_ url: URL, exitCode: Int = 0) throws {
+    /// A Wine that exits with `exitCode`, or fails only the `failing` command (as `reg`).
+    func fakeWine(_ url: URL, exitCode: Int = 0, failing: String? = nil) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // wineboot creates the folders prepareBottle's later steps use.
         let wineboot = "[ \"$1\" = wineboot ] && mkdir -p \"$WINEPREFIX/dosdevices\" \"$WINEPREFIX/drive_c/windows/system32\"\n"
-        try Data("#!/bin/sh\n\(wineboot)exit \(exitCode)\n".utf8).write(to: url)
+        let failure = failing.map { "[ \"$1\" = \($0) ] && exit 1\n" } ?? ""
+        try Data("#!/bin/sh\n\(wineboot)\(failure)exit \(exitCode)\n".utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
     func fakeRuntime(_ service: WineService) throws {
@@ -251,9 +253,9 @@ struct EngineProfileTests {
         let bottlePaths = try readyBottle(gtaBottle(), in: service)
         let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
         let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
-        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
         try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
-        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
         #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
         #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
         #expect(try FileManager.default.contentsOfDirectory(atPath: backup.path).sorted() == ["d3d10core.dll", "d3d11.dll", "dxgi.dll"])
@@ -298,8 +300,9 @@ struct EngineProfileTests {
         #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains("CaptureDisplaysForFullscreen") == false)
     }
 
-    /// A preparation that failed after applying the profile leaves its files; once the bottle is switched off
-    /// (update() only saves that for a bottle that is not ready), the next preparation takes them out.
+    /// A preparation that failed after applying the profile (its registry import failed) leaves its files; once
+    /// the bottle is switched off (update() only saves that for a bottle that is not ready), the next preparation
+    /// takes them out.
     @Test func preparingAHalfPreparedBottleOffTheProfileLeavesIt() async throws {
         let (root, service) = try scratchRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -307,8 +310,11 @@ struct EngineProfileTests {
         var bottle = gtaBottle()
         let bottlePaths = try readyBottle(bottle, in: service)
         let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
-        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
         try FileManager.default.removeItem(at: bottlePaths.marker)
+        let profileWine = service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wine")
+        try fakeWine(profileWine, failing: "reg")
+        await #expect(throws: (any Error).self) { try await service.prepareBottle(bottle) }
+        try fakeWine(profileWine)
         bottle.engineProfile = nil
         try await service.update(bottle)
         #expect(try service.bottle(bottle.id).engineProfile == nil)
@@ -346,6 +352,123 @@ struct EngineProfileTests {
         #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
         #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains(EngineProfile.gta5Enhanced.cleanupRegistry) == true)
         #expect(try FileManager.default.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut/engine-backup").path).isEmpty)
+    }
+
+    /// Where a switch can fail part-way, and how to make it fail there and undo that.
+    enum SwitchFailure: CaseIterable {
+        case driveY, files, registry, save
+
+        func inject(_ service: WineService, _ bottlePaths: BottlePaths, wine: URL) throws {
+            switch self {
+            case .driveY: try lock(bottlePaths.prefix.appendingPathComponent("dosdevices"), true)
+            case .files: try lock(bottlePaths.drive.appendingPathComponent("windows/system32"), true)
+            case .registry: try EngineProfileTests().fakeWine(wine, exitCode: 1)
+            case .save: try lock(service.paths.root, true)
+            }
+        }
+        func undo(_ service: WineService, _ bottlePaths: BottlePaths, wine: URL) throws {
+            switch self {
+            case .driveY: try lock(bottlePaths.prefix.appendingPathComponent("dosdevices"), false)
+            case .files: try lock(bottlePaths.drive.appendingPathComponent("windows/system32"), false)
+            case .registry: try EngineProfileTests().fakeWine(wine)
+            case .save: try lock(service.paths.root, false)
+            }
+        }
+        func lock(_ folder: URL, _ locked: Bool) throws {
+            try FileManager.default.setAttributes([.posixPermissions: locked ? 0o555 : 0o755], ofItemAtPath: folder.path)
+        }
+    }
+
+    /// The prefix is on `profile`'s engine (nil: Portnaut's): drive Y:, system32 and the registry profile.
+    func expectOnEngine(_ profile: EngineProfile?, _ service: WineService, _ bottlePaths: BottlePaths) throws {
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let drive = bottlePaths.prefix.appendingPathComponent("dosdevices/y:")
+        let registry = contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg")) ?? ""
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: drive.path) == (profile.map { service.paths.profile($0).root } ?? service.paths.runtime).path)
+        if profile == nil {
+            for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
+            #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent("d3d12.dll").path))
+            #expect(!registry.contains("\"CaptureDisplaysForFullscreen\"=\"y\""))
+        } else {
+            #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
+            #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
+            #expect(registry.hasSuffix(EngineProfile.gta5Enhanced.registry))
+        }
+    }
+
+    /// An engine switch that fails at any step leaves the saved choice as it was, and the next program start
+    /// brings the prefix back to that engine; choosing that engine again is no change, so nothing else does.
+    @Test(arguments: SwitchFailure.allCases, [false, true])
+    func aStartAfterAFailedSwitchIsOnTheSavedEngine(failure: SwitchFailure, switchingOn: Bool) async throws {
+        let (root, service) = try scratchRoot()
+        defer {
+            try? failure.undo(service, service.paths.bottle(gtaBottle()), wine: service.paths.wine(for: .d3dmetal))
+            try? FileManager.default.removeItem(at: root)
+        }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let program = bottlePaths.drive.appendingPathComponent("game.exe")
+        try Data().write(to: program)
+        let from: EngineProfile? = switchingOn ? nil : .gta5Enhanced
+        let to: EngineProfile? = switchingOn ? .gta5Enhanced : nil
+        if !switchingOn {
+            bottle.engineProfile = .gta5Enhanced
+            try await service.update(bottle)
+        }
+        // The Wine of the engine the bottle switches to imports the registry.
+        let wine = switchingOn ? service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wine") : service.paths.wine(for: .d3dmetal)
+        try failure.inject(service, bottlePaths, wine: wine)
+        bottle.engineProfile = to
+        await #expect(throws: (any Error).self) { try await service.update(bottle) }
+        try failure.undo(service, bottlePaths, wine: wine)
+        #expect(try service.bottle(bottle.id).engineProfile == from)
+        bottle.engineProfile = from
+        try await service.launch(program, in: bottle, waitForSession: false)
+        try expectOnEngine(from, service, bottlePaths)
+    }
+
+    /// A bottle set up on the profile before engine records existed (its backup there, no record) is switched
+    /// off through update() before any start: the profile's files and values still go.
+    @Test func aBottleFromBeforeRecordsLeavesTheProfile() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        var bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try service.mapRuntimeDrive(bottlePaths, to: service.paths.profile(.gta5Enhanced).root)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+        bottle.engineProfile = nil
+        try await service.update(bottle)
+        try expectOnEngine(nil, service, bottlePaths)
+        #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains(EngineProfile.gta5Enhanced.cleanupRegistry) == true)
+        #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
+    }
+
+    /// A start with a bottle whose engine is not the saved one is refused, so no other engine's Wine runs on the
+    /// prefix; a drive Y: pointing elsewhere under a matching record is pointed at the engine again.
+    @Test func aStartChecksTheCallersEngineAndDriveY() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        let bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let program = bottlePaths.drive.appendingPathComponent("game.exe")
+        try Data().write(to: program)
+        try await service.update(bottle)
+        var stale = bottle
+        stale.engineProfile = nil
+        await #expect(throws: PortnautError.self) { try await service.launch(program, in: stale, waitForSession: false) }
+        try service.mapRuntimeDrive(bottlePaths, to: root.appendingPathComponent("elsewhere"))
+        try await service.launch(program, in: bottle, waitForSession: false)
+        try expectOnEngine(.gta5Enhanced, service, bottlePaths)
     }
 
     /// Every value the profile writes is removed by its cleanup, which comes before the bottle's own values.

@@ -231,3 +231,40 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
         return lines.joined(separator: "\n") + "\n"
     }
 }
+
+/// What a bottle's prefix holds of its engine, kept in drive_c/Portnaut/engine-state.json (written whole) by
+/// WineService.applyEngine, which marks a change before it touches the prefix and records the result after.
+enum EngineState: Equatable, Codable {
+    /// Drive Y:, system32 and the registry are on this engine (nil: Portnaut's runtime); a profile's backup
+    /// holds the system32 files it replaced.
+    case applied(EngineProfile?)
+    /// A change began and did not finish: the prefix may be anywhere between engines. `holding`'s files may be
+    /// in system32 and its values in the registry, and its backup, when there is one, holds the originals.
+    case changing(holding: EngineProfile?)
+
+    /// The profile whose backup holds the originals.
+    var held: EngineProfile? {
+        switch self {
+        case .applied(let profile): profile
+        case .changing(let holding): holding
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case state, profile }
+    private enum Kind: String, Codable { case applied, changing }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let profile = try container.decodeIfPresent(EngineProfile.self, forKey: .profile)
+        switch try container.decode(Kind.self, forKey: .state) {
+        case .applied: self = .applied(profile)
+        case .changing: self = .changing(holding: profile)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(self == .applied(held) ? Kind.applied : Kind.changing, forKey: .state)
+        try container.encodeIfPresent(held, forKey: .profile)
+    }
+}

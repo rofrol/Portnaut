@@ -121,11 +121,10 @@ extension WineService {
             if let now = current.first(where: { $0.id == restored.games[index].id }) { restored.games[index].performance = now.performance }
         }
         try save(restored)
-        // The snapshot's drive Y: may point at the other engine; its files and registry are the snapshot's own.
+        // The snapshot's drive Y: may point at the other engine; its files, registry and engine record are the snapshot's own.
         let engineReady = restored.engineProfile.map { paths.profileReady($0) } ?? paths.runtimeReady
         guard paths.bottle(restored).ready, engineReady else { return }
-        try mapRuntimeDrive(paths.bottle(restored), to: restored.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
-        try await applyProfile(restored)
+        try await applyEngine(restored)
     }
 
     /// Moves a snapshot to the Trash.
