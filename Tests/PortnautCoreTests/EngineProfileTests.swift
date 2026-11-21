@@ -179,7 +179,9 @@ struct EngineProfileTests {
     }
     func fakeWine(_ url: URL, exitCode: Int = 0) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("#!/bin/sh\nexit \(exitCode)\n".utf8).write(to: url)
+        // wineboot creates the folders prepareBottle's later steps use.
+        let wineboot = "[ \"$1\" = wineboot ] && mkdir -p \"$WINEPREFIX/dosdevices\" \"$WINEPREFIX/drive_c/windows/system32\"\n"
+        try Data("#!/bin/sh\n\(wineboot)exit \(exitCode)\n".utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
     func fakeRuntime(_ service: WineService) throws {
@@ -210,16 +212,35 @@ struct EngineProfileTests {
         try Data().write(to: service.paths.runtimeMarker)
         try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
         try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
-        // What wineboot would create; the fake Wine only exits.
-        let planned = service.paths.bottle(Bottle(id: "rockstar-games-launcher", name: "Rockstar Games Launcher", renderer: .dxmt))
-        try FileManager.default.createDirectory(at: planned.prefix.appendingPathComponent("dosdevices"), withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: planned.drive.appendingPathComponent("windows/system32"), withIntermediateDirectories: true)
         let bottle = try await service.createBottle(name: "Rockstar Games Launcher", launcher: .rockstar, renderer: .dxmt, engineProfile: .gta5Enhanced)
         #expect(bottle.id == "rockstar-games-launcher")
         #expect(try service.bottle(bottle.id).engineProfile == .gta5Enhanced)
         let system32 = service.paths.bottle(bottle).drive.appendingPathComponent("windows/system32")
         #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
         #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
+    }
+
+    /// A failed creation removes only the folder it reserved: a folder left by a bottle no longer in the
+    /// library keeps its contents, and the new bottle takes the next free name.
+    @Test func aFailedCreationLeavesAnUnlistedFolderAlone() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        #expect(service.paths.runtimeReady)
+        try fakeWine(service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wine"), exitCode: 1)
+        try service.paths.saveLibrary(Library())
+        let leftover = service.paths.bottles.appendingPathComponent("rockstar-games-launcher/drive_c/saves.dat")
+        try FileManager.default.createDirectory(at: leftover.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("kept".utf8).write(to: leftover)
+        await #expect(throws: (any Error).self) {
+            _ = try await service.createBottle(name: "Rockstar Games Launcher", launcher: .rockstar, renderer: .dxmt, engineProfile: .gta5Enhanced)
+        }
+        #expect(contents(leftover) == "kept")
+        #expect(!FileManager.default.fileExists(atPath: service.paths.bottles.appendingPathComponent("rockstar-games-launcher-2").path))
+        #expect(try service.paths.loadLibrary().bottles.isEmpty)
     }
 
     /// Entering keeps system32's originals once; a re-apply, or a repeated entry after a switch that did not

@@ -142,6 +142,7 @@ final class CoreTests {
         #expect(library.newBottleID(for: "Steam & Friends!") == "steam-friends")
         library.bottles = [Bottle(id: "steam", name: "Steam", renderer: .dxmt)]
         #expect(library.newBottleID(for: "Steam") == "steam-2")
+        #expect(library.newBottleID(for: "Steam") { $0 == "steam-2" } == "steam-3")
         #expect(library.newBottleID(for: "😀") == "bottle")
     }
 

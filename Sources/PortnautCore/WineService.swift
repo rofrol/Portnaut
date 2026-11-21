@@ -473,7 +473,12 @@ public final class WineService: @unchecked Sendable {
                              windowsVersion: WindowsVersion = .win10, easyMode: Bool = true) async throws -> Bottle {
         guard paths.runtimeReady else { throw PortnautError("Prepare Portnaut first.") }
         var library = try paths.loadLibrary()
-        var bottle = Bottle(id: library.newBottleID(for: name), name: name, launcher: launcher, renderer: renderer)
+        let fm = FileManager.default
+        try fm.createDirectory(at: paths.bottles, withIntermediateDirectories: true)
+        let id = library.newBottleID(for: name) { (try? fm.attributesOfItem(atPath: paths.bottles.appendingPathComponent($0).path)) != nil }
+        var bottle = Bottle(id: id, name: name, launcher: launcher, renderer: renderer)
+        // Reserves the folder: this fails if one appeared since, so a failed creation removes only its own.
+        try fm.createDirectory(at: paths.bottle(bottle).prefix, withIntermediateDirectories: false)
         bottle.engineProfile = engineProfile
         bottle.windowsVersion = windowsVersion
         bottle.easyMode = easyMode
@@ -481,7 +486,7 @@ public final class WineService: @unchecked Sendable {
         bottle.createdAt = Date()
         do { try await prepareBottle(bottle) }
         catch {
-            try? FileManager.default.removeItem(at: paths.bottle(bottle).prefix)
+            try? fm.removeItem(at: paths.bottle(bottle).prefix)
             throw error
         }
         library.update(bottle)
@@ -507,6 +512,10 @@ public final class WineService: @unchecked Sendable {
         }
         try mapRuntimeDrive(bottlePaths, to: bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
         // A new bottle's system32 is wineboot's own: keep it, as for a bottle switching to the profile.
+        // On a profile-born bottle, the files leaving the profile puts back (dxgi, d3d11, d3d10core, d3d12;
+        // wineboot writes no atidxx64) are the profile engine's, with Wine's builtin mark. Portnaut's own Wine
+        // ships all four and loads its own builtin for a marked file (ntdll's load_builtin; every renderer
+        // forces d3d11, dxgi and d3d10core to builtin), and its prefix update overwrites marked files.
         try await applyProfile(bottle, entering: isNew)
         try await ProcessRunner.run(paths.wine(for: bottle), ["cmd", "/c", "ver"], environment: environment(for: bottle), directory: bottlePaths.drive, log: paths.setupLog, timeout: 30)
         // Wine writes system.reg when its server exits. A new environment has no programs of the
