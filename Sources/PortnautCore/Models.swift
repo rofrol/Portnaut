@@ -189,7 +189,36 @@ public struct PortnautPaths: Sendable {
         }
         return try JSONDecoder().decode(LegacyLibraryState.self, from: data).migrated()
     }
-    public func saveLibrary(_ state: Library) throws {
+    /// Runs `body` holding the library lock (flock on .library.lock), which every Portnaut process on this root
+    /// (the app, portnaut-doctor) takes to change library.json, so no writer saves over another's change.
+    /// Held around synchronous work only: nothing awaits while holding it, and a body never takes it again
+    /// (save, modifyLibrary): each call opens the lock file anew, so a nested call would wait on itself.
+    func withLibraryLock<T>(_ body: () throws -> T) throws -> T {
+        try createDirectories()
+        let fd = open(root.appendingPathComponent(".library.lock").path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        guard fd >= 0 else { throw PortnautError("Portnaut cannot open its library lock (\(String(cString: strerror(errno))))." ) }
+        defer { close(fd) }
+        // flock returns EINTR for each signal caught while it waits (a handler without SA_RESTART); it is
+        // asked again then. The bound only keeps the loop finite: each pass needs another signal.
+        var locked = false
+        for _ in 0..<10_000 where !locked {
+            if flock(fd, LOCK_EX) == 0 { locked = true } else if errno != EINTR { break }
+        }
+        guard locked else { throw PortnautError("Portnaut cannot lock its library (\(String(cString: strerror(errno))))." ) }
+        return try body()
+    }
+    /// Reads the library, changes it and saves it under the library lock: the only way library.json is written.
+    @discardableResult
+    func modifyLibrary<T>(_ change: (inout Library) throws -> T) throws -> T {
+        try withLibraryLock {
+            var state = try loadLibrary()
+            let result = try change(&state)
+            try saveLibrary(state)
+            return result
+        }
+    }
+    /// Writes library.json; callers go through modifyLibrary, which holds the lock.
+    func saveLibrary(_ state: Library) throws {
         try createDirectories()
         let fm = FileManager.default
         // Keep a 0.1.x file once, before the first save in the new format replaces it.

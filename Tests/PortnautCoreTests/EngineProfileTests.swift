@@ -245,6 +245,49 @@ struct EngineProfileTests {
         #expect(try service.paths.loadLibrary().bottles.isEmpty)
     }
 
+    /// A bottle saved by another writer while a creation prepares its bottle (wineboot takes minutes) stays in
+    /// the library: the creation registers its bottle in the library as it is then.
+    @Test func aCreationKeepsABottleSavedWhileItPrepares() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        try service.paths.saveLibrary(Library())
+        // The other writer's library, put in place whole while wineboot runs, as saveLibrary writes it.
+        let other = Bottle(id: "other", name: "Other", launcher: nil, renderer: .dxmt)
+        let otherLibrary = root.appendingPathComponent("other-library.json")
+        try JSONEncoder().encode(Library(bottles: [other])).write(to: otherLibrary)
+        let wine = service.paths.wine(for: .dxmt)
+        let library = service.paths.library.path
+        try fakeWine(wine)
+        let script = try #require(contents(wine))
+        try Data(script.replacingOccurrences(of: "#!/bin/sh\n", with: "#!/bin/sh\n[ \"$1\" = wineboot ] && cp '\(otherLibrary.path)' '\(library).new' && mv '\(library).new' '\(library)'\n").utf8).write(to: wine)
+        let created = try await service.createBottle(name: "New", launcher: nil, renderer: .dxmt)
+        #expect(Set(try service.library().bottles.map(\.id)) == ["other", created.id])
+        // removeBottle tells a bottle from a later one at its id by this, so it survives the library's round trip.
+        #expect(try service.bottle(created.id).createdAt == created.createdAt)
+    }
+
+    /// A removal of a bottle no longer listed (removed already), or listed as one created since at the same id,
+    /// leaves the folder at that id, which may be the new creation's.
+    @Test func aRepeatedRemovalLeavesTheFolderAlone() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try service.paths.saveLibrary(Library())
+        try await service.removeBottle(bottle)
+        #expect(FileManager.default.fileExists(atPath: bottlePaths.marker.path))
+        var recreated = bottle
+        recreated.createdAt = Date()
+        try service.paths.saveLibrary(Library(bottles: [recreated]))
+        try await service.removeBottle(bottle)
+        #expect(FileManager.default.fileExists(atPath: bottlePaths.marker.path))
+        #expect(try service.library().bottles.map(\.id) == [bottle.id])
+    }
+
     /// Entering keeps system32's originals once; a re-apply, or a repeated entry after a switch that did not
     /// finish, keeps them; leaving puts them back (repeatably) and removes what the bottle did not have.
     @Test func leavingTheProfilePutsSystem32Back() throws {

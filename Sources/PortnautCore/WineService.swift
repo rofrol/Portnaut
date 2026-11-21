@@ -93,9 +93,7 @@ public final class WineService: @unchecked Sendable {
 
     public func library() throws -> Library { try paths.loadLibrary() }
     public func save(_ bottle: Bottle) throws {
-        var library = try paths.loadLibrary()
-        library.update(bottle)
-        try paths.saveLibrary(library)
+        try paths.modifyLibrary { $0.update(bottle) }
     }
     public func bottle(_ id: String) throws -> Bottle {
         guard let bottle = try paths.loadLibrary().bottle(id) else { throw PortnautError("There is no bottle called \(id).") }
@@ -461,8 +459,8 @@ public final class WineService: @unchecked Sendable {
             if updating, paths.bottle(bottle).ready { try takeSnapshot(of: bottle, label: "Before updating Portnaut", automatic: true) }
             try await prepareBottle(bottle)
         }
-        // Persists a migrated 0.1.x library in the bottle format.
-        try paths.saveLibrary(library)
+        // Persists a migrated 0.1.x library in the bottle format (read again: bottles may have changed meanwhile).
+        try paths.modifyLibrary { _ in }
         await progress(SetupProgress(1, "Portnaut is ready"))
     }
 
@@ -472,25 +470,29 @@ public final class WineService: @unchecked Sendable {
     public func createBottle(name: String, launcher: Launcher?, renderer: Renderer, engineProfile: EngineProfile? = nil,
                              windowsVersion: WindowsVersion = .win10, easyMode: Bool = true) async throws -> Bottle {
         guard paths.runtimeReady else { throw PortnautError("Prepare Portnaut first.") }
-        var library = try paths.loadLibrary()
         let fm = FileManager.default
         try fm.createDirectory(at: paths.bottles, withIntermediateDirectories: true)
-        let id = library.newBottleID(for: name) { (try? fm.attributesOfItem(atPath: paths.bottles.appendingPathComponent($0).path)) != nil }
-        var bottle = Bottle(id: id, name: name, launcher: launcher, renderer: renderer)
-        // Reserves the folder: this fails if one appeared since, so a failed creation removes only its own.
-        try fm.createDirectory(at: paths.bottle(bottle).prefix, withIntermediateDirectories: false)
+        // The name is chosen and its folder reserved under the library lock, so a creation at the same time (here
+        // or in portnaut-doctor) takes the next name; the folder is this creation's, so a failure removes it.
+        var bottle = try paths.withLibraryLock {
+            let id = try paths.loadLibrary().newBottleID(for: name) { (try? fm.attributesOfItem(atPath: paths.bottles.appendingPathComponent($0).path)) != nil }
+            let bottle = Bottle(id: id, name: name, launcher: launcher, renderer: renderer)
+            try fm.createDirectory(at: paths.bottle(bottle).prefix, withIntermediateDirectories: false)
+            return bottle
+        }
         bottle.engineProfile = engineProfile
         bottle.windowsVersion = windowsVersion
         bottle.easyMode = easyMode
         bottle.autoBackupSaves = easyMode
         bottle.createdAt = Date()
-        do { try await prepareBottle(bottle) }
-        catch {
+        do {
+            try await prepareBottle(bottle)
+            // Registered in the library as it is now, not as it was before the preparation's minutes.
+            try save(bottle)
+        } catch {
             try? fm.removeItem(at: paths.bottle(bottle).prefix)
             throw error
         }
-        library.update(bottle)
-        try paths.saveLibrary(library)
         return bottle
     }
 
@@ -530,13 +532,17 @@ public final class WineService: @unchecked Sendable {
     /// Moves the bottle's folder to the Trash, so it can still be restored from there.
     public func removeBottle(_ bottle: Bottle) async throws {
         try? await stop(bottle)
-        var library = try paths.loadLibrary()
-        let prefix = paths.bottle(bottle).prefix
-        if FileManager.default.fileExists(atPath: prefix.path) { try FileManager.default.trashItem(at: prefix, resultingItemURL: nil) }
-        let snapshots = paths.snapshots(of: bottle)
-        if FileManager.default.fileExists(atPath: snapshots.path) { try? FileManager.default.trashItem(at: snapshots, resultingItemURL: nil) }
-        library.bottles.removeAll { $0.id == bottle.id }
-        try paths.saveLibrary(library)
+        // Under the library lock, so a creation cannot take the id between the folder going and the entry going;
+        // a bottle no longer listed (or listed as one created since, at the same id) was removed already, and the
+        // id's folder may be a new creation's.
+        try paths.modifyLibrary { library in
+            guard let listed = library.bottle(bottle.id), listed.createdAt == bottle.createdAt else { return }
+            let prefix = paths.bottle(bottle).prefix
+            if FileManager.default.fileExists(atPath: prefix.path) { try FileManager.default.trashItem(at: prefix, resultingItemURL: nil) }
+            let snapshots = paths.snapshots(of: bottle)
+            if FileManager.default.fileExists(atPath: snapshots.path) { try? FileManager.default.trashItem(at: snapshots, resultingItemURL: nil) }
+            library.bottles.removeAll { $0.id == bottle.id }
+        }
     }
 
     private func isolateUserFolders(_ bottlePaths: BottlePaths) throws {
