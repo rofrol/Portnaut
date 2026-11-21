@@ -9,4 +9,4 @@ args=()
 if [[ -f "$plugin" ]]; then
   args=(-Xswiftc -load-plugin-library -Xswiftc "$plugin")
 fi
-swift test --package-path "$project" --scratch-path "$build_dir" --disable-xctest "${args[@]}"
+swift test --package-path "$project" --scratch-path "$build_dir" --disable-xctest ${args[@]+"${args[@]}"}

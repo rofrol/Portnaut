@@ -162,6 +162,21 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
         }
     }
 
+    /// Removes every value `registry` writes, imported before the bottle's own profile when the bottle
+    /// leaves this engine, so the values a game or launcher of the bottle sets come back after it.
+    var cleanupRegistry: String {
+        registry.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+            guard line.hasPrefix("\""), let end = line.dropFirst().firstIndex(of: "\"") else { return String(line) }
+            return String(line[...end]) + "=-"
+        }.joined(separator: "\n")
+    }
+
+    /// The names systemCopies writes into system32, each once.
+    func systemNames(layout: Layout) -> [String] {
+        var seen = Set<String>()
+        return systemCopies(layout: layout).map(\.name).filter { seen.insert($0).inserted }
+    }
+
     /// Files copied into the prefix's system32, later ones replacing earlier ones: D3DMetal's dxgi, d3d11
     /// and d3d12 and the template's atidxx64, then the rockstar pack's WineD3D d3d11, dxgi and d3d10core.
     func systemCopies(layout: Layout) -> [(from: URL, name: String)] {

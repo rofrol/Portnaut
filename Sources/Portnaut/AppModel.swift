@@ -154,6 +154,8 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
+        // A running task (a save downloading an engine profile, say) has the library in flux; it refreshes when done.
+        guard !busy else { return }
         let paths = service.paths
         runtimeReady = paths.runtimeReady
         runtimeOutdated = paths.runtimeOutdated
@@ -246,14 +248,14 @@ final class AppModel: ObservableObject {
     }
     /// Saves a changed bottle; the registry part applies to programs started afterwards.
     func save(_ bottle: Bottle) {
-        guard let old = library.bottle(bottle.id), old != bottle else { return }
+        guard !busy, let old = library.bottle(bottle.id), old != bottle else { return }
         if old.renderer != bottle.renderer || old.engineProfile != bottle.engineProfile, sessionActive(bottle) {
             error = "Stop \(bottle.name)’s Windows session before switching its renderer or engine."
             return
         }
         library.update(bottle)
         perform("Saving \(bottle.name)…") { [self] in
-            try await service.update(bottle)
+            try await service.update(bottle) { [self] value in await update(value) }
             return sessionActive(bottle) ? "Saved. Restart \(bottle.name)’s programs to apply it." : "Saved. Applies the next time a program starts in \(bottle.name)."
         }
     }
@@ -446,7 +448,7 @@ final class AppModel: ObservableObject {
     }
     func restoreSnapshot(_ snapshot: Snapshot, of bottle: Bottle) {
         perform("Restoring \(bottle.name)…") { [self] in
-            try await service.restoreSnapshot(snapshot, of: bottle)
+            try await service.restoreSnapshot(snapshot, of: bottle) { [self] value in await update(value) }
             return "\(bottle.name) is back as it was on \(snapshot.date.formatted(date: .abbreviated, time: .shortened)). Its state before the restore is kept as a snapshot."
         }
     }

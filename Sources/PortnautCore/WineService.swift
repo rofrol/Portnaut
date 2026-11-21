@@ -503,7 +503,8 @@ public final class WineService: @unchecked Sendable {
             }
         }
         try mapRuntimeDrive(bottlePaths, to: bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
-        try await applyProfile(bottle)
+        // A new bottle's system32 is wineboot's own: keep it, as for a bottle switching to the profile.
+        try await applyProfile(bottle, entering: isNew)
         try await ProcessRunner.run(paths.wine(for: bottle), ["cmd", "/c", "ver"], environment: environment(for: bottle), directory: bottlePaths.drive, log: paths.setupLog, timeout: 30)
         // Wine writes system.reg when its server exits. A new environment has no programs of the
         // user's running, so wait for that; an existing one may be in use and is already written.
@@ -557,12 +558,13 @@ public final class WineService: @unchecked Sendable {
     static let runtimeDrive = "y"
 
     /// The bottle's Windows version, display resolution mode, and per-program values.
-    public static func profile(for bottle: Bottle) -> String {
+    /// `leaving`: the engine profile the bottle has just left; its values are removed first.
+    public static func profile(for bottle: Bottle, leaving: EngineProfile? = nil) -> String {
         let dpi = bottle.retinaMode ? "000000c0" : "00000060"
         return """
         Windows Registry Editor Version 5.00
 
-        [HKEY_CURRENT_USER\\Software\\Wine]
+        \(leaving?.cleanupRegistry ?? "")[HKEY_CURRENT_USER\\Software\\Wine]
         "Version"="\(bottle.windowsVersion.rawValue)"
 
         [HKEY_CURRENT_USER\\Software\\Wine\\Mac Driver]
@@ -614,25 +616,69 @@ public final class WineService: @unchecked Sendable {
         return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
     }
 
-    public func applyProfile(_ bottle: Bottle) async throws {
+    /// Writes and imports the bottle's registry profile. `entering` is set when the bottle has just
+    /// switched to its engine profile (from none or another), `leaving` names the profile it has just left;
+    /// both only on a switch, never on a re-apply.
+    public func applyProfile(_ bottle: Bottle, entering: Bool = false, leaving: EngineProfile? = nil) async throws {
         let directory = paths.bottle(bottle).drive.appendingPathComponent("Portnaut")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        if let profile = bottle.engineProfile { try applyFiles(of: profile, to: paths.bottle(bottle)) }
-        try Data(Self.profile(for: bottle).utf8).write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
+        if let leaving { try restoreFiles(of: leaving, to: paths.bottle(bottle)) }
+        if let profile = bottle.engineProfile { try applyFiles(of: profile, to: paths.bottle(bottle), backUp: entering) }
+        try Data(Self.profile(for: bottle, leaving: leaving).utf8).write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
         try await ProcessRunner.run(paths.wine(for: bottle), ["reg", "import", "C:\\Portnaut\\profile.reg"], environment: environment(for: bottle),
                                     directory: paths.bottle(bottle).drive, log: paths.setupLog, timeout: 30)
     }
 
+    /// Where the system32 files an engine profile replaced are kept while the bottle uses it.
+    func engineBackup(of profile: EngineProfile, in bottlePaths: BottlePaths) -> URL {
+        bottlePaths.drive.appendingPathComponent("Portnaut/engine-backup/\(profile.rawValue)")
+    }
+
     /// An engine profile's graphics libraries in system32 and the game's arguments in its commandline.txt.
-    func applyFiles(of profile: EngineProfile, to bottlePaths: BottlePaths) throws {
+    /// With `backUp`, the files they replace are kept first (built aside, then moved into place whole);
+    /// a backup already there is from a switch that did not finish and holds the originals, so it stays.
+    func applyFiles(of profile: EngineProfile, to bottlePaths: BottlePaths, backUp: Bool = false) throws {
         let fm = FileManager.default
         let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let backup = engineBackup(of: profile, in: bottlePaths)
+        if backUp, !fm.fileExists(atPath: backup.path) {
+            let stage = bottlePaths.drive.appendingPathComponent("Portnaut/.engine-backup-" + UUID().uuidString)
+            try fm.createDirectory(at: stage, withIntermediateDirectories: true)
+            do {
+                for name in profile.systemNames(layout: paths.profile(profile)) {
+                    let original = system32.appendingPathComponent(name)
+                    if (try? fm.destinationOfSymbolicLink(atPath: original.path)) != nil || fm.fileExists(atPath: original.path) {
+                        try fm.copyItem(at: original, to: stage.appendingPathComponent(name))
+                    }
+                }
+                try fm.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.moveItem(at: stage, to: backup)
+            } catch {
+                try? fm.removeItem(at: stage)
+                throw error
+            }
+        }
         for copy in profile.systemCopies(layout: paths.profile(profile)) {
             let target = system32.appendingPathComponent(copy.name)
             if (try? fm.destinationOfSymbolicLink(atPath: target.path)) != nil || fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
             try fm.copyItem(at: copy.from, to: target)
         }
         try writeGameArguments(to: bottlePaths)
+    }
+
+    /// Takes an engine profile's files out of system32 and puts back copies of the ones its backup kept;
+    /// update() discards the backup once the switch is saved. A bottle switched before backups existed
+    /// has none: the profile's files are only removed.
+    func restoreFiles(of profile: EngineProfile, to bottlePaths: BottlePaths) throws {
+        let fm = FileManager.default
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let backup = engineBackup(of: profile, in: bottlePaths)
+        for name in profile.systemNames(layout: paths.profile(profile)) {
+            let target = system32.appendingPathComponent(name)
+            if (try? fm.destinationOfSymbolicLink(atPath: target.path)) != nil || fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
+            let kept = backup.appendingPathComponent(name)
+            if (try? fm.destinationOfSymbolicLink(atPath: kept.path)) != nil || fm.fileExists(atPath: kept.path) { try fm.copyItem(at: kept, to: target) }
+        }
     }
     /// Adds the profile's game arguments to commandline.txt once the game is installed. Runs before every
     /// program of a profile bottle, so a game the launcher installs later gets them too. A file that is not
@@ -643,6 +689,8 @@ public final class WineService: @unchecked Sendable {
         let file = game.appendingPathComponent("commandline.txt")
         // A file that exists but cannot be read is left alone too.
         let data: Data? = FileManager.default.fileExists(atPath: file.path) ? try Data(contentsOf: file) : nil
+        // UTF-16 without a byte-order mark, ASCII only, is valid UTF-8 too; its NUL bytes give it away.
+        if let data, data.contains(0) { return }
         let current = data.map { String(decoding: $0, as: UTF8.self) }
         if let data, current.map({ Data($0.utf8) }) != data { return }
         let merged = EngineProfile.commandLine(merging: current)
@@ -650,14 +698,33 @@ public final class WineService: @unchecked Sendable {
     }
 
     /// Saves changed settings and applies the registry part, which takes effect for the next programs started.
-    public func update(_ bottle: Bottle) async throws {
+    public func update(_ bottle: Bottle, progress: @escaping @Sendable (SetupProgress) async -> Void = { _ in }) async throws {
         // A bottle switched to an engine profile gets it built (downloaded) before the switch is saved,
         // so a failed download leaves the bottle as it was; then its drive Y: moves to the profile.
-        if let profile = bottle.engineProfile, paths.bottle(bottle).ready { try await prepareProfile(profile) }
+        if let profile = bottle.engineProfile, paths.bottle(bottle).ready { try await prepareProfile(profile, progress: progress) }
+        let old = try? self.bottle(bottle.id).engineProfile
+        let bottlePaths = paths.bottle(bottle)
+        guard bottlePaths.ready else { return try save(bottle) }
+        // The prefix records the profile it holds by that profile's backup, so a switch that did not finish
+        // (its choice unsaved, or its backup not yet discarded) is still left properly.
+        let fm = FileManager.default
+        let leaving = old.flatMap { $0 == bottle.engineProfile ? nil : $0 }
+            ?? EngineProfile.allCases.first { $0 != bottle.engineProfile && fm.fileExists(atPath: engineBackup(of: $0, in: bottlePaths).path) }
+        let switched = old != bottle.engineProfile || leaving != nil
+        // An engine switch is saved only once it has applied, and the backup it leaves is discarded only once
+        // saved: every step before can be repeated.
+        if !switched { try save(bottle) }
+        try mapRuntimeDrive(bottlePaths, to: bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
+        try await applyProfile(bottle, entering: old != bottle.engineProfile && bottle.engineProfile != nil, leaving: leaving)
+        guard switched else { return }
         try save(bottle)
-        guard paths.bottle(bottle).ready else { return }
-        try mapRuntimeDrive(paths.bottle(bottle), to: bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
-        try await applyProfile(bottle)
+        if let leaving {
+            // Renamed first, so the backup is either whole or gone.
+            let backup = engineBackup(of: leaving, in: bottlePaths)
+            let discarded = backup.deletingLastPathComponent().appendingPathComponent(".discarded-" + UUID().uuidString)
+            if fm.fileExists(atPath: backup.path) { try fm.moveItem(at: backup, to: discarded) }
+            try? fm.removeItem(at: discarded)
+        }
     }
 
     // MARK: - Launchers and games

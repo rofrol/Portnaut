@@ -88,10 +88,13 @@ struct EngineProfileTests {
         try Data("-windowed\n".utf8).write(to: file)
         try service.writeGameArguments(to: bottlePaths)
         #expect(try String(contentsOf: file, encoding: .utf8) == "-windowed\n-disableSpatialAudioClient\n-nobattleye\n")
-        let utf16 = "-windowed".data(using: .utf16)!
-        try utf16.write(to: file)
-        try service.writeGameArguments(to: bottlePaths)
-        #expect(try Data(contentsOf: file) == utf16)
+        // With a byte-order mark, and without one in either byte order (ASCII only, so also valid UTF-8).
+        for encoding in [String.Encoding.utf16, .utf16LittleEndian, .utf16BigEndian] {
+            let utf16 = "-windowed".data(using: encoding)!
+            try utf16.write(to: file)
+            try service.writeGameArguments(to: bottlePaths)
+            #expect(try Data(contentsOf: file) == utf16)
+        }
     }
 
     /// The profile's per-program overrides come after a game's own, so they win.
@@ -137,5 +140,203 @@ struct EngineProfileTests {
         #expect(EngineProfile.commandLine(merging: "-windowed\n-nobattleye\n") == "-windowed\n-nobattleye\n-disableSpatialAudioClient\n")
         let once = EngineProfile.commandLine(merging: "-fullscreen")
         #expect(EngineProfile.commandLine(merging: once) == once)
+    }
+
+    // MARK: - Switching engines
+
+    /// A scratch Portnaut root whose engine profile is built: a marker, a Wine that only exits, and
+    /// sentinel files for every system32 copy. Portnaut's own renderers have no Wine until fakeRuntime.
+    func scratchRoot() throws -> (URL, WineService) {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("portnaut-engine-" + UUID().uuidString)
+        let service = WineService(paths: PortnautPaths(root: root), metalShim: nil)
+        let profile = EngineProfile.gta5Enhanced
+        let layout = service.paths.profile(profile)
+        try fakeWine(layout.engine.appendingPathComponent("bin/wine"))
+        try fakeWine(layout.engine.appendingPathComponent("bin/wineserver"))
+        try Data(profile.marker.utf8).write(to: layout.markerFile)
+        for copy in profile.systemCopies(layout: layout) {
+            try fm.createDirectory(at: copy.from.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("profile:\(copy.from.path)".utf8).write(to: copy.from)
+        }
+        try service.paths.createDirectories()
+        return (root, service)
+    }
+    func fakeWine(_ url: URL, exitCode: Int = 0) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("#!/bin/sh\nexit \(exitCode)\n".utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+    func fakeRuntime(_ service: WineService) throws {
+        for renderer in Renderer.allCases { try fakeWine(service.paths.wine(for: renderer)); try fakeWine(service.paths.wineserver(for: renderer)) }
+    }
+
+    /// A ready bottle in the library, with Portnaut's dxgi, d3d11 and d3d10core in system32 and no d3d12 or atidxx64.
+    func readyBottle(_ bottle: Bottle, in service: WineService) throws -> BottlePaths {
+        let fm = FileManager.default
+        let bottlePaths = service.paths.bottle(bottle)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        try fm.createDirectory(at: system32, withIntermediateDirectories: true)
+        try fm.createDirectory(at: bottlePaths.prefix.appendingPathComponent("dosdevices"), withIntermediateDirectories: true)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { try Data("original:\(name)".utf8).write(to: system32.appendingPathComponent(name)) }
+        try Data().write(to: bottlePaths.prefix.appendingPathComponent("system.reg"))
+        try Data("portnaut-bottle-v1\n".utf8).write(to: bottlePaths.marker)
+        try service.paths.saveLibrary(Library(bottles: [bottle]))
+        return bottlePaths
+    }
+
+    func contents(_ url: URL) -> String? { (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) } }
+
+    /// Entering keeps system32's originals once; a re-apply, or a repeated entry after a switch that did not
+    /// finish, keeps them; leaving puts them back (repeatably) and removes what the bottle did not have.
+    @Test func leavingTheProfilePutsSystem32Back() throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bottlePaths = try readyBottle(gtaBottle(), in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
+        #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
+        #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("RockstarRenderer") == true)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: backup.path).sorted() == ["d3d10core.dll", "d3d11.dll", "dxgi.dll"])
+        #expect(contents(backup.appendingPathComponent("dxgi.dll")) == "original:dxgi.dll")
+        for _ in 0..<2 { try service.restoreFiles(of: .gta5Enhanced, to: bottlePaths) }
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
+        for name in ["d3d12.dll", "atidxx64.dll"] { #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent(name).path)) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut").path).allSatisfy { !$0.hasPrefix(".engine-backup") })
+    }
+
+    /// Through update(), as the Engine picker and `portnaut-doctor engine` switch: on, a re-save, then off,
+    /// where the first try fails (Portnaut's Wine is missing) and is saved only when a retry applies.
+    @Test func switchingTheEngineOnAndOffThroughUpdate() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let drive = bottlePaths.prefix.appendingPathComponent("dosdevices/y:")
+        bottle.engineProfile = .gta5Enhanced
+        try await service.update(bottle)
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: drive.path) == service.paths.profile(.gta5Enhanced).root.path)
+        bottle.highResolution.toggle()
+        try await service.update(bottle)
+        #expect(contents(service.engineBackup(of: .gta5Enhanced, in: bottlePaths).appendingPathComponent("dxgi.dll")) == "original:dxgi.dll")
+        bottle.engineProfile = nil
+        await #expect(throws: (any Error).self) { try await service.update(bottle) }
+        #expect(try service.bottle(bottle.id).engineProfile == .gta5Enhanced)
+        #expect(FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
+        try fakeRuntime(service)
+        try await service.update(bottle)
+        #expect(try service.bottle(bottle.id).engineProfile == nil)
+        #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: drive.path) == service.paths.runtime.path)
+        #expect(contents(system32.appendingPathComponent("dxgi.dll")) == "original:dxgi.dll")
+        #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent("d3d12.dll").path))
+        let registry = try #require(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg")))
+        #expect(registry.contains(EngineProfile.gta5Enhanced.cleanupRegistry))
+        #expect(!registry.contains("\"CaptureDisplaysForFullscreen\"=\"y\""))
+        try await service.update(bottle)
+        #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains("CaptureDisplaysForFullscreen") == false)
+    }
+
+    /// A switch on that fails after copying the profile's files is not saved; switching off (a save with
+    /// no profile) still finds the profile in the prefix by its backup and takes it out.
+    @Test func aFailedSwitchOnIsUndoneBySwitchingOff() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let profileWine = service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wine")
+        try fakeWine(profileWine, exitCode: 1)
+        bottle.engineProfile = .gta5Enhanced
+        await #expect(throws: (any Error).self) { try await service.update(bottle) }
+        #expect(try service.bottle(bottle.id).engineProfile == nil)
+        #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
+        try fakeWine(profileWine)
+        bottle.engineProfile = nil
+        try await service.update(bottle)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
+        #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent("d3d12.dll").path))
+        #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
+        #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains(EngineProfile.gta5Enhanced.cleanupRegistry) == true)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut/engine-backup").path).isEmpty)
+    }
+
+    /// Every value the profile writes is removed by its cleanup, which comes before the bottle's own values.
+    @Test func cleanupRemovesEveryProfileValueAndKeepsTheBottlesOwn() {
+        func values(_ registry: String) -> Set<String> {
+            var section = "", found = Set<String>()
+            for line in registry.split(separator: "\n") {
+                if line.hasPrefix("[") { section = String(line) }
+                else if line.hasPrefix("\""), let end = line.dropFirst().firstIndex(of: "\"") { found.insert(section + line[...end]) }
+            }
+            return found
+        }
+        let profile = EngineProfile.gta5Enhanced
+        #expect(values(profile.cleanupRegistry) == values(profile.registry))
+        #expect(profile.cleanupRegistry.split(separator: "\n").filter { $0.hasPrefix("\"") }.allSatisfy { $0.hasSuffix("=-") })
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        var game = Game(id: "gta5", name: "GTA V Enhanced", executable: EngineProfile.gameFolder + "/GTA5_Enhanced.exe")
+        game.dllOverrides = ["dxgi": .native]
+        bottle.games = [game]
+        let registry = WineService.profile(for: bottle, leaving: profile)
+        let removed = registry.range(of: "\"dxgi\"=-")
+        let restored = registry.range(of: "\"dxgi\"=\"native\"")
+        #expect(removed != nil && restored != nil && removed!.lowerBound < restored!.lowerBound)
+        let socialClub = registry.range(of: "\"CommandLineAppend\"=\"")
+        #expect(socialClub != nil && removed!.lowerBound < socialClub!.lowerBound)
+        #expect(registry.hasPrefix("Windows Registry Editor Version 5.00\n\n" + profile.cleanupRegistry))
+    }
+
+    /// Restoring a snapshot of a profile bottle points drive Y: at the profile again.
+    @Test func restoringAProfileSnapshotPointsDriveYAtTheProfile() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bottlePaths = try readyBottle(gtaBottle(), in: service)
+        let snapshot = try service.takeSnapshot(of: gtaBottle(), label: "On the profile")
+        var plain = gtaBottle()
+        plain.engineProfile = nil
+        try service.save(plain)
+        try service.mapRuntimeDrive(bottlePaths, to: service.paths.runtime)
+        try await service.restoreSnapshot(snapshot, of: plain)
+        #expect(try service.bottle(plain.id).engineProfile == .gta5Enhanced)
+        let drive = bottlePaths.prefix.appendingPathComponent("dosdevices/y:")
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: drive.path) == service.paths.profile(.gta5Enhanced).root.path)
+    }
+
+    /// A profile that cannot be built stops the restore before the bottle changes.
+    @Test func restoringAProfileSnapshotWithoutTheProfileChangesNothing() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("portnaut-engine-" + UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        let service = WineService(paths: PortnautPaths(root: root), metalShim: nil)
+        try service.paths.createDirectories()
+        let bottlePaths = try readyBottle(gtaBottle(), in: service)
+        let snapshot = try service.takeSnapshot(of: gtaBottle(), label: "On the profile")
+        var plain = gtaBottle()
+        plain.engineProfile = nil
+        try service.save(plain)
+        let sentinel = bottlePaths.drive.appendingPathComponent("after-snapshot.txt")
+        try Data("kept".utf8).write(to: sentinel)
+        // Downloads is a file, so building the profile fails before anything is fetched.
+        try fm.removeItem(at: service.paths.cache)
+        try Data().write(to: service.paths.cache)
+        await #expect(throws: (any Error).self) { try await service.restoreSnapshot(snapshot, of: plain) }
+        #expect(contents(sentinel) == "kept")
+        #expect(try service.bottle(plain.id).engineProfile == nil)
+        #expect(service.snapshots(of: plain).count == 1)
+    }
+
+    @Test func aProfileBottleHasNoBestSetup() {
+        let game = Game(id: "gta5", name: "GTA V Enhanced", executable: EngineProfile.gameFolder + "/GTA5_Enhanced.exe")
+        let service = WineService(paths: PortnautPaths(root: URL(fileURLWithPath: "/tmp/portnaut-root")), metalShim: nil)
+        #expect(throws: PortnautError.self) { try service.startSetupTrial(for: game, in: gtaBottle()) }
     }
 }

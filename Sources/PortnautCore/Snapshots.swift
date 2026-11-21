@@ -98,10 +98,13 @@ extension WineService {
 
     /// Puts the bottle back as it was, settings and games included. Its current state is kept as an
     /// automatic snapshot first, so a restore can itself be undone.
-    public func restoreSnapshot(_ snapshot: Snapshot, of bottle: Bottle) async throws {
+    /// A snapshot of a bottle on an engine profile gets that profile built first, so a failed download
+    /// leaves the bottle as it is.
+    public func restoreSnapshot(_ snapshot: Snapshot, of bottle: Bottle, progress: @escaping @Sendable (SetupProgress) async -> Void = { _ in }) async throws {
         let fm = FileManager.default
         let source = paths.snapshots(of: bottle).appendingPathComponent(snapshot.id).appendingPathComponent("prefix")
         guard fm.fileExists(atPath: source.path) else { throw PortnautError("That snapshot is no longer in Portnaut’s data folder.") }
+        if let profile = snapshot.bottle.engineProfile { try await prepareProfile(profile, progress: progress) }
         try? await stop(bottle)
         let prefix = paths.bottle(bottle).prefix
         if fm.fileExists(atPath: prefix.path) {
@@ -118,6 +121,11 @@ extension WineService {
             if let now = current.first(where: { $0.id == restored.games[index].id }) { restored.games[index].performance = now.performance }
         }
         try save(restored)
+        // The snapshot's drive Y: may point at the other engine; its files and registry are the snapshot's own.
+        let engineReady = restored.engineProfile.map { paths.profileReady($0) } ?? paths.runtimeReady
+        guard paths.bottle(restored).ready, engineReady else { return }
+        try mapRuntimeDrive(paths.bottle(restored), to: restored.engineProfile.map { paths.profile($0).root } ?? paths.runtime)
+        try await applyProfile(restored)
     }
 
     /// Moves a snapshot to the Trash.

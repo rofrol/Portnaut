@@ -110,16 +110,18 @@ struct FeaturedGame: View {
             if let report = model.reports[entry.id] {
                 CompatibilityRow(report: report).card(padding: 14)
             }
-            if let trial = entry.game.setupTrial { BestSetupCard(entry: entry, trial: trial) }
+            if let trial = entry.game.setupTrial, entry.bottle.engineProfile == nil { BestSetupCard(entry: entry, trial: trial) }
             PerformanceCard(entry: entry)
-            if entry.bottle.easyMode, let analysis, analysis.recommendation.renderer != entry.bottle.renderer {
+            // A profile bottle's engine replaces the renderer, so neither banner applies.
+            let rendererBottle = entry.bottle.engineProfile == nil
+            if rendererBottle, entry.bottle.easyMode, let analysis, analysis.recommendation.renderer != entry.bottle.renderer {
                 HStack(spacing: 10) {
                     Image(systemName: "wand.and.stars").foregroundStyle(Palette.cyan)
                     Text("Easy mode switches \(entry.bottle.name) to the renderer that suits \(entry.game.name) when you press Play.")
                         .font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
                     Spacer()
                 }.card(padding: 14)
-            } else if let analysis, analysis.recommendation.renderer != entry.bottle.renderer {
+            } else if rendererBottle, let analysis, analysis.recommendation.renderer != entry.bottle.renderer {
                 HStack(spacing: 10) {
                     Image(systemName: "lightbulb").foregroundStyle(Palette.accent)
                     Text("\(entry.game.name) recommends \(analysis.recommendation.renderer.title); \(entry.bottle.name) uses \(entry.bottle.renderer.title). Change it in the bottle’s settings, or give the game its own bottle.")

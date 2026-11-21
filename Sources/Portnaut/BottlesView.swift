@@ -103,44 +103,48 @@ struct BottleDetail: View {
                     Text(profile.detail).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
                     Text(profile.licenseNote).font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
                 }
-                Picker("Renderer", selection: binding(\.renderer, fallback: bottle)) {
-                    ForEach(Renderer.allCases) { Text($0.title).tag($0) }
-                }.pickerStyle(.segmented).labelsHidden().disabled(running || model.busy || bottle.engineProfile != nil)
-                Text(bottle.renderer.detail).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                if let recommendation {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: recommendation.renderer == bottle.renderer ? "checkmark.seal" : "lightbulb")
-                            .foregroundStyle(recommendation.renderer == bottle.renderer ? Palette.cyan : Palette.accent)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Recommended: \(recommendation.renderer.title)").font(.system(size: 12, weight: .semibold))
-                            Text(recommendation.reason).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer()
-                        if recommendation.renderer != bottle.renderer {
-                            Button("Use \(recommendation.renderer.title)") { binding(\.renderer, fallback: bottle).wrappedValue = recommendation.renderer }
-                                .buttonStyle(PortnautButtonStyle(primary: true)).frame(height: 28).disabled(running || model.busy)
-                        }
-                    }.padding(12).background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+                if let profile = bottle.engineProfile {
+                    Text("\(profile.title)’s engine replaces the renderer, so the renderer, its recommendation, MetalFX and DLSS do not apply to this bottle.").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Picker("Renderer", selection: binding(\.renderer, fallback: bottle)) {
+                        ForEach(Renderer.allCases) { Text($0.title).tag($0) }
+                    }.pickerStyle(.segmented).labelsHidden().disabled(running || model.busy)
+                    Text(bottle.renderer.detail).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    if let recommendation {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: recommendation.renderer == bottle.renderer ? "checkmark.seal" : "lightbulb")
+                                .foregroundStyle(recommendation.renderer == bottle.renderer ? Palette.cyan : Palette.accent)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Recommended: \(recommendation.renderer.title)").font(.system(size: 12, weight: .semibold))
+                                Text(recommendation.reason).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                            if recommendation.renderer != bottle.renderer {
+                                Button("Use \(recommendation.renderer.title)") { binding(\.renderer, fallback: bottle).wrappedValue = recommendation.renderer }
+                                    .buttonStyle(PortnautButtonStyle(primary: true)).frame(height: 28).disabled(running || model.busy)
+                            }
+                        }.padding(12).background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+                    }
+                    if let note = [bottle.renderer, recommendation?.renderer].compactMap({ $0?.licenseNote }).first {
+                        Label(note, systemImage: "doc.text").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let launcher = bottle.launcher, launcher.unsupportedRenderers.contains(bottle.renderer) {
+                        Label("\(launcher.title) does not start properly on \(bottle.renderer.title) (tested). Use \(launcher.recommendation.renderer.title).", systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.accent).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if bottle.renderer == .dxmt {
+                        let display = MainDisplay.description
+                        Toggle("MetalFX upscaling", isOn: binding(\.options.metalFXUpscaling, fallback: bottle)).toggleStyle(.switch).disabled(model.busy)
+                        Text("Games render at \(display.points), the Mac’s point resolution with a quarter of the pixels, and MetalFX upscales the picture to \(display.pixels). Leave the game’s resolution at the highest it offers. Its HUD is upscaled too; for a sharper HUD, lower the game’s own resolution scale instead. Applies to every program in the bottle from its next session.")
+                            .font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if bottle.renderer == .dxmt || bottle.renderer == .d3dmetal {
+                        Toggle("DLSS through MetalFX", isOn: binding(\.options.dlss, fallback: bottle)).toggleStyle(.switch).disabled(model.busy)
+                        Text("For games that offer DLSS: turn DLSS on in the game and MetalFX does the upscaling\(bottle.renderer == .d3dmetal ? " (Apple’s D3DMetal)" : " (DXMT’s bridge)"). Games then see an NVIDIA graphics card, so turn this off if one misbehaves.")
+                            .font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-                if let note = [bottle.renderer, recommendation?.renderer].compactMap({ $0?.licenseNote }).first {
-                    Label(note, systemImage: "doc.text").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                }
-                if running { Text("Stop the session to switch renderer.").font(.system(size: 11)).foregroundStyle(Palette.accent) }
-                if let launcher = bottle.launcher, launcher.unsupportedRenderers.contains(bottle.renderer) {
-                    Label("\(launcher.title) does not start properly on \(bottle.renderer.title) (tested). Use \(launcher.recommendation.renderer.title).", systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.accent).fixedSize(horizontal: false, vertical: true)
-                }
-                if bottle.renderer == .dxmt {
-                    let display = MainDisplay.description
-                    Toggle("MetalFX upscaling", isOn: binding(\.options.metalFXUpscaling, fallback: bottle)).toggleStyle(.switch).disabled(model.busy)
-                    Text("Games render at \(display.points), the Mac’s point resolution with a quarter of the pixels, and MetalFX upscales the picture to \(display.pixels). Leave the game’s resolution at the highest it offers. Its HUD is upscaled too; for a sharper HUD, lower the game’s own resolution scale instead. Applies to every program in the bottle from its next session.")
-                        .font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                }
-                if bottle.renderer == .dxmt || bottle.renderer == .d3dmetal {
-                    Toggle("DLSS through MetalFX", isOn: binding(\.options.dlss, fallback: bottle)).toggleStyle(.switch).disabled(model.busy)
-                    Text("For games that offer DLSS: turn DLSS on in the game and MetalFX does the upscaling\(bottle.renderer == .d3dmetal ? " (Apple’s D3DMetal)" : " (DXMT’s bridge)"). Games then see an NVIDIA graphics card, so turn this off if one misbehaves.")
-                        .font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                }
+                if running { Text("Stop the session to switch renderer or engine.").font(.system(size: 11)).foregroundStyle(Palette.accent) }
                 ForEach(bottle.games) { game in
                     if let analysis = model.analyses["\(bottle.id)/\(game.id)"] {
                         HStack {
@@ -148,7 +152,7 @@ struct BottleDetail: View {
                             Text("\(analysis.is64Bit ? "64-bit" : "32-bit") · \((analysis.imported.isEmpty ? analysis.mentioned : analysis.imported).map(\.title).joined(separator: ", ").isEmpty ? "no graphics API found" : (analysis.imported.isEmpty ? analysis.mentioned : analysis.imported).map(\.title).joined(separator: ", "))")
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             Spacer()
-                            RendererBadge(current: bottle.renderer, recommended: analysis.recommendation)
+                            if bottle.engineProfile == nil { RendererBadge(current: bottle.renderer, recommended: analysis.recommendation) }
                         }
                     }
                 }
