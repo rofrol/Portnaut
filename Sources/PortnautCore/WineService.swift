@@ -516,7 +516,10 @@ public final class WineService: @unchecked Sendable {
         // wineboot writes no atidxx64) are the profile engine's, with Wine's builtin mark. Portnaut's own Wine
         // ships all four and loads its own builtin for a marked file (ntdll's load_builtin; every renderer
         // forces d3d11, dxgi and d3d10core to builtin), and its prefix update overwrites marked files.
-        try await applyProfile(bottle, entering: isNew)
+        // A preparation that failed after applying a profile the bottle has left since (update() only saves
+        // the choice for a bottle that is not ready) left that profile's files and values: take them out.
+        let leaving = heldProfile(in: bottlePaths, besides: bottle.engineProfile)
+        try await applyProfile(bottle, entering: isNew, leaving: leaving)
         try await ProcessRunner.run(paths.wine(for: bottle), ["cmd", "/c", "ver"], environment: environment(for: bottle), directory: bottlePaths.drive, log: paths.setupLog, timeout: 30)
         // Wine writes system.reg when its server exits. A new environment has no programs of the
         // user's running, so wait for that; an existing one may be in use and is already written.
@@ -524,6 +527,7 @@ public final class WineService: @unchecked Sendable {
             _ = try? await ProcessRunner.run(paths.wineserver(for: bottle), ["-w"], environment: environment(for: bottle), log: paths.setupLog, timeout: 60, allowFailure: true)
         }
         try Data("portnaut-bottle-v1\n".utf8).write(to: bottlePaths.marker, options: .atomic)
+        if let leaving { try discardBackup(of: leaving, in: bottlePaths) }
     }
 
     /// Moves the bottle's folder to the Trash, so it can still be restored from there.
@@ -719,9 +723,7 @@ public final class WineService: @unchecked Sendable {
         guard bottlePaths.ready else { return try save(bottle) }
         // The prefix records the profile it holds by that profile's backup, so a switch that did not finish
         // (its choice unsaved, or its backup not yet discarded) is still left properly.
-        let fm = FileManager.default
-        let leaving = old.flatMap { $0 == bottle.engineProfile ? nil : $0 }
-            ?? EngineProfile.allCases.first { $0 != bottle.engineProfile && fm.fileExists(atPath: engineBackup(of: $0, in: bottlePaths).path) }
+        let leaving = old.flatMap { $0 == bottle.engineProfile ? nil : $0 } ?? heldProfile(in: bottlePaths, besides: bottle.engineProfile)
         let switched = old != bottle.engineProfile || leaving != nil
         // An engine switch is saved only once it has applied, and the backup it leaves is discarded only once
         // saved: every step before can be repeated.
@@ -730,13 +732,22 @@ public final class WineService: @unchecked Sendable {
         try await applyProfile(bottle, entering: old != bottle.engineProfile && bottle.engineProfile != nil, leaving: leaving)
         guard switched else { return }
         try save(bottle)
-        if let leaving {
-            // Renamed first, so the backup is either whole or gone.
-            let backup = engineBackup(of: leaving, in: bottlePaths)
-            let discarded = backup.deletingLastPathComponent().appendingPathComponent(".discarded-" + UUID().uuidString)
-            if fm.fileExists(atPath: backup.path) { try fm.moveItem(at: backup, to: discarded) }
-            try? fm.removeItem(at: discarded)
-        }
+        if let leaving { try discardBackup(of: leaving, in: bottlePaths) }
+    }
+
+    /// The engine profile the prefix still holds although the bottle is not on it, found by that profile's
+    /// backup: a switch or a preparation that did not finish leaves it there until the profile is left.
+    func heldProfile(in bottlePaths: BottlePaths, besides current: EngineProfile?) -> EngineProfile? {
+        EngineProfile.allCases.first { $0 != current && FileManager.default.fileExists(atPath: engineBackup(of: $0, in: bottlePaths).path) }
+    }
+
+    /// Discards a profile's backup once the bottle has left the profile; renamed first, so it is either whole or gone.
+    func discardBackup(of profile: EngineProfile, in bottlePaths: BottlePaths) throws {
+        let fm = FileManager.default
+        let backup = engineBackup(of: profile, in: bottlePaths)
+        let discarded = backup.deletingLastPathComponent().appendingPathComponent(".discarded-" + UUID().uuidString)
+        if fm.fileExists(atPath: backup.path) { try fm.moveItem(at: backup, to: discarded) }
+        try? fm.removeItem(at: discarded)
     }
 
     // MARK: - Launchers and games

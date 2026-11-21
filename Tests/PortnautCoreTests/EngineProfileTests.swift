@@ -298,6 +298,30 @@ struct EngineProfileTests {
         #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains("CaptureDisplaysForFullscreen") == false)
     }
 
+    /// A preparation that failed after applying the profile leaves its files; once the bottle is switched off
+    /// (update() only saves that for a bottle that is not ready), the next preparation takes them out.
+    @Test func preparingAHalfPreparedBottleOffTheProfileLeavesIt() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        var bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
+        try FileManager.default.removeItem(at: bottlePaths.marker)
+        bottle.engineProfile = nil
+        try await service.update(bottle)
+        #expect(try service.bottle(bottle.id).engineProfile == nil)
+        #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
+        try await service.prepareBottle(bottle)
+        #expect(bottlePaths.ready)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
+        #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent("d3d12.dll").path))
+        #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
+        let registry = try #require(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg")))
+        #expect(registry.contains(EngineProfile.gta5Enhanced.cleanupRegistry))
+    }
+
     /// A switch on that fails after copying the profile's files is not saved; switching off (a save with
     /// no profile) still finds the profile in the prefix by its backup and takes it out.
     @Test func aFailedSwitchOnIsUndoneBySwitchingOff() async throws {
