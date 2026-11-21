@@ -17,7 +17,8 @@ public struct ProfileDownload: Sendable, Equatable {
 /// on this fork's own engine: Wine 11.13 with MacGames' GTA V patches (Rockstar Games Launcher feature
 /// level, GTA D3D12Core loading and others; engines/gta5-wine on the fork's gta5-wine-engine branch), built
 /// in the fork's Actions with WineD3D builds of d3d11, dxgi and d3d10core for the Rockstar Games Launcher and
-/// Social Club, which do not start on D3DMetal; Apple's D3DMetal 4.0b2 for the game. The layout mirrors
+/// Social Club, which do not start on D3DMetal; Apple's D3DMetal 4.0b3 for the game, from Sikarugir's template
+/// 1.0.27 (MacGames uses 4.0b2; 4.0b3 played in the same layout, item 5zsf6d). The layout mirrors
 /// MacGames' GameEnvironment.gta5, PrefixSetup.graphicsCopies and GameRecipes.registry("gta5-enhanced").
 public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable {
     case gta5Enhanced = "gta5-enhanced"
@@ -31,7 +32,7 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
 
     public var detail: String {
         switch self {
-        case .gta5Enhanced: "Wine 11.13 with MacGames’ GTA V patches and Apple’s D3DMetal 4.0b2 for the game; the Rockstar Games Launcher draws with Wine’s own Direct3D. Replaces the bottle’s renderer."
+        case .gta5Enhanced: "Wine 11.13 with MacGames’ GTA V patches and Apple’s D3DMetal 4.0b3 for the game; the Rockstar Games Launcher draws with Wine’s own Direct3D. Replaces the bottle’s renderer."
         }
     }
 
@@ -45,34 +46,34 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
     /// Shown wherever the profile can be chosen: the parts' own licences apply.
     public var licenseNote: String {
         switch self {
-        case .gta5Enhanced: "Downloaded from this fork’s releases (Wine, with its source), Sikarugir’s template and MacGames’ D3DMetal pack. D3DMetal is Apple’s, from the Game Porting Toolkit; its licence covers non-commercial use for developing, testing and evaluating games on Apple hardware."
+        case .gta5Enhanced: "Downloaded from this fork’s releases (Wine, with its source), and Sikarugir’s templates. D3DMetal is Apple’s, from the Game Porting Toolkit; its licence covers non-commercial use for developing, testing and evaluating games on Apple hardware."
         }
     }
 
     static let templateApp = "Template-1.0.15.app/Contents/Frameworks"
-    static let d3dmetalPack = "apple-d3dmetal-4.0b2"
+    /// D3DMetal 4.0b3 as Sikarugir's template 1.0.27 ships it (its renderer/d3dmetal), unpacked under packs/.
+    static let d3dmetalPack = "sikarugir-d3dmetal-4.0b3"
+    static let d3dmetalMember = "Template-1.0.27.app/Contents/SharedSupport/renderer/d3dmetal"
 
     /// The fork's engine release (engine/ and launcher-wined3d/), Sikarugir's template 1.0.15 (the engine's
-    /// libraries) and MacGames' D3DMetal pack from its packs-1 release, with the hash MacGames pins (Packs.swift).
+    /// libraries and atidxx64) and Sikarugir's template 1.0.27 (D3DMetal 4.0b3).
     public var downloads: [ProfileDownload] {
         switch self {
         case .gta5Enhanced:
-            let packs = "https://github.com/tarikbc/macgames/releases/download/packs-1/"
             return [
                 ProfileDownload(url: URL(string: "https://github.com/rofrol/Portnaut/releases/download/\(Self.engineRelease)/\(Self.engineRelease).tar.xz")!,
                                 fileName: "\(Self.engineRelease).tar.xz", sha256: Self.engineSHA256),
                 ProfileDownload(url: URL(string: "https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.15.tar.xz")!, fileName: "Template-1.0.15.tar.xz",
                                 sha256: "34273bcce885ce5a7fd6937af9ea344bb9961de7d55d6193f7413142e835c8c3"),
-                ProfileDownload(url: URL(string: packs + "macgames-pack-\(Self.d3dmetalPack).tar.xz")!, fileName: "macgames-pack-\(Self.d3dmetalPack).tar.xz",
-                                sha256: "209a9203864a0618d686096162f75ce506838fcfe3a715b997f87759dbbee02e", size: 15_870_444),
+                ProfileDownload(url: URL(string: "https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.27.tar.xz")!, fileName: "Template-1.0.27.tar.xz",
+                                sha256: "dd0778f7b553d63df9b0f4e2cda3f3c6c005aabb75588c84d604afe80cdedbb9", size: 96_161_660),
             ]
         }
     }
 
     var engineArchive: String { downloads[0].fileName }
     var templateArchive: String { downloads[1].fileName }
-    /// MacGames packs unpacked under packs/.
-    var packs: [String] { [Self.d3dmetalPack] }
+    var d3dmetalArchive: String { downloads[2].fileName }
 
     /// The engine release built by the fork's build-gta5-wine workflow, and its archive's SHA-256.
     static let engineRelease = "gta5-wine-11.13-local"
@@ -99,7 +100,7 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
 
     /// Written into the built profile; a different value rebuilds it. The version names how the profile is
     /// assembled (engineLinks, layout): change it with them, as the downloads' hashes do not.
-    var marker: String { "\(rawValue)-v2:" + downloads.map(\.sha256).joined(separator: "+") }
+    var marker: String { "\(rawValue)-v3:" + downloads.map(\.sha256).joined(separator: "+") }
 
     // MARK: - Layout
 

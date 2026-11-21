@@ -175,9 +175,13 @@ public final class WineService: @unchecked Sendable {
             try await unpack(profile.templateArchive, into: sources, [EngineProfile.templateApp])
             try fm.createDirectory(at: staged.frameworks.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.moveItem(at: sources.appendingPathComponent(EngineProfile.templateApp), to: staged.frameworks)
-            for pack in profile.packs {
-                try await unpack("macgames-pack-\(pack).tar.xz", into: stage.appendingPathComponent("packs"))
-                guard fm.fileExists(atPath: staged.pack(pack).path) else { throw PortnautError("The \(pack) pack has an unexpected layout.") }
+            try await unpack(profile.d3dmetalArchive, into: sources, [EngineProfile.d3dmetalMember])
+            try fm.createDirectory(at: staged.d3dmetal.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: sources.appendingPathComponent(EngineProfile.d3dmetalMember), to: staged.d3dmetal)
+            // linkTarget falls back to the template's own (older) D3DMetal for a file this folder lacks, so a
+            // folder without D3DMetal's Unix side would mix versions silently.
+            guard fm.fileExists(atPath: staged.d3dmetal.appendingPathComponent("external/libd3dshared.dylib").path) else {
+                throw PortnautError("\(EngineProfile.d3dmetalMember) has an unexpected layout.")
             }
             // The engine reaches D3DMetal through these links, which replace the engine's own files.
             for (relative, target) in EngineProfile.engineLinks {
