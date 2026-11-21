@@ -117,9 +117,9 @@ struct EngineProfileTests {
         let copies = EngineProfile.gta5Enhanced.systemCopies(layout: EngineProfile.Layout(root: URL(fileURLWithPath: "/p")))
         var final: [String: String] = [:]
         for copy in copies { final[copy.name] = copy.from.path }
-        #expect(final["dxgi.dll"] == "/p/packs/rockstar/RockstarRenderer/dxgi.dll")
-        #expect(final["d3d11.dll"] == "/p/packs/rockstar/RockstarRenderer/d3d11.dll")
-        #expect(final["d3d10core.dll"] == "/p/packs/rockstar/RockstarRenderer/d3d10core.dll")
+        #expect(final["dxgi.dll"] == "/p/launcher-wined3d/dxgi.dll")
+        #expect(final["d3d11.dll"] == "/p/launcher-wined3d/d3d11.dll")
+        #expect(final["d3d10core.dll"] == "/p/launcher-wined3d/d3d10core.dll")
         #expect(final["d3d12.dll"] == "/p/packs/apple-d3dmetal-4.0b2/wine/x86_64-windows/d3d12.dll")
         #expect(final["atidxx64.dll"] == "/p/deps/Frameworks/renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll")
     }
@@ -130,6 +130,15 @@ struct EngineProfileTests {
         #expect(EngineProfile.linkTarget("renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll") { _ in false }
                 == "deps/Frameworks/renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll")
         #expect(EngineProfile.linkTarget("libfreetype.6.dylib") { _ in true } == "deps/Frameworks/libfreetype.6.dylib")
+        // D3DMetal 4.0b2's pack has the Unix side but no atidxx64.dll; that one comes from the template.
+        let pack: Set = ["external/libd3dshared.dylib", "wine/x86_64-windows/d3d11.dll"]
+        let targets = Dictionary(uniqueKeysWithValues: EngineProfile.engineLinks.map { ($0.link, EngineProfile.linkTarget($0.target) { pack.contains($0) }) })
+        #expect(targets["lib/wine/x86_64-unix/d3d12.so"] == "packs/apple-d3dmetal-4.0b2/external/libd3dshared.dylib")
+        #expect(targets["lib/wine/x86_64-windows/atidxx64.dll"] == "deps/Frameworks/renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll")
+        // The game gets D3DMetal's dxgi from the engine's own folder, which Wine searches before WINEDLLPATH.
+        let pack2: Set = ["external/libd3dshared.dylib", "wine/x86_64-windows/dxgi.dll"]
+        #expect(EngineProfile.engineLinks.first { $0.link == "lib/wine/x86_64-windows/dxgi.dll" }
+                    .map { EngineProfile.linkTarget($0.target) { pack2.contains($0) } } == "packs/apple-d3dmetal-4.0b2/wine/x86_64-windows/dxgi.dll")
         #expect(EngineProfile.relativeLink(from: "engine/lib/wine/x86_64-windows/dxgi.dll", to: "packs/x/dxgi.dll") == "../../../../packs/x/dxgi.dll")
         let base = URL(fileURLWithPath: "/root/engine/lib/wine/x86_64-windows/")
         #expect(URL(fileURLWithPath: "../../../../packs/x/dxgi.dll", relativeTo: base).standardizedFileURL.path == "/root/packs/x/dxgi.dll")
@@ -199,7 +208,7 @@ struct EngineProfileTests {
         try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
         try service.applyFiles(of: .gta5Enhanced, to: bottlePaths, backUp: true)
         #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
-        #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("RockstarRenderer") == true)
+        #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
         #expect(try FileManager.default.contentsOfDirectory(atPath: backup.path).sorted() == ["d3d10core.dll", "d3d11.dll", "dxgi.dll"])
         #expect(contents(backup.appendingPathComponent("dxgi.dll")) == "original:dxgi.dll")
         for _ in 0..<2 { try service.restoreFiles(of: .gta5Enhanced, to: bottlePaths) }

@@ -13,54 +13,49 @@ public struct ProfileDownload: Sendable, Equatable {
 /// a third-party engine that has it. Nothing of the profile ships with Portnaut: its parts are
 /// downloaded from their publishers and checked against the hashes below.
 ///
-/// gta5Enhanced is the GTA V Enhanced environment of MacGames 0.1.6 (https://github.com/tarikbc/macgames):
-/// its Wine 11.13 engine with the gta5 overlay (Rockstar Games Launcher feature-level and GTA D3D12Core
-/// patches), Apple's D3DMetal 4.0b2 for the game, and WineD3D builds of d3d11, dxgi and d3d10core for the
-/// Rockstar Games Launcher and Social Club, which do not start on D3DMetal. The layout mirrors MacGames'
-/// GameEnvironment.gta5, PrefixSetup.graphicsCopies and GameRecipes.registry("gta5-enhanced").
+/// gta5Enhanced is the GTA V Enhanced environment of MacGames 0.1.6 (https://github.com/tarikbc/macgames)
+/// on this fork's own engine: Wine 11.13 with MacGames' GTA V patches (Rockstar Games Launcher feature
+/// level, GTA D3D12Core loading and others; engines/gta5-wine on the fork's gta5-wine-engine branch), built
+/// in the fork's Actions with WineD3D builds of d3d11, dxgi and d3d10core for the Rockstar Games Launcher and
+/// Social Club, which do not start on D3DMetal; Apple's D3DMetal 4.0b2 for the game. The layout mirrors
+/// MacGames' GameEnvironment.gta5, PrefixSetup.graphicsCopies and GameRecipes.registry("gta5-enhanced").
 public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable {
     case gta5Enhanced = "gta5-enhanced"
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .gta5Enhanced: "GTA V Enhanced (MacGames engine)"
+        case .gta5Enhanced: "GTA V Enhanced (Wine 11.13 with MacGames’ patches)"
         }
     }
 
     public var detail: String {
         switch self {
-        case .gta5Enhanced: "MacGames’ Wine 11.13 with its GTA V patches and Apple’s D3DMetal 4.0b2 for the game; the Rockstar Games Launcher draws with Wine’s own Direct3D. Replaces the bottle’s renderer."
+        case .gta5Enhanced: "Wine 11.13 with MacGames’ GTA V patches and Apple’s D3DMetal 4.0b2 for the game; the Rockstar Games Launcher draws with Wine’s own Direct3D. Replaces the bottle’s renderer."
         }
     }
 
     /// Shown wherever the profile can be chosen: the parts' own licences apply.
     public var licenseNote: String {
         switch self {
-        case .gta5Enhanced: "Downloaded from MacGames’ releases (engine and packs) and Sikarugir’s template. D3DMetal is Apple’s, from the Game Porting Toolkit; its licence covers non-commercial use for developing, testing and evaluating games on Apple hardware."
+        case .gta5Enhanced: "Downloaded from this fork’s releases (Wine, with its source), Sikarugir’s template and MacGames’ D3DMetal pack. D3DMetal is Apple’s, from the Game Porting Toolkit; its licence covers non-commercial use for developing, testing and evaluating games on Apple hardware."
         }
     }
 
-    static let macGamesApp = "MacGames.app/Contents/Resources/Runtime"
     static let templateApp = "Template-1.0.15.app/Contents/Frameworks"
     static let d3dmetalPack = "apple-d3dmetal-4.0b2"
 
-    /// MacGames 0.1.6's app (only its Runtime/Engine and dependency links are used), Sikarugir's template
-    /// 1.0.15 (the engine's libraries) and MacGames' packs-1 release, with the hashes MacGames pins
-    /// (Packs.swift, Downloader.swift) and the app's from its release.
+    /// The fork's engine release (engine/ and launcher-wined3d/), Sikarugir's template 1.0.15 (the engine's
+    /// libraries) and MacGames' D3DMetal pack from its packs-1 release, with the hash MacGames pins (Packs.swift).
     public var downloads: [ProfileDownload] {
         switch self {
         case .gta5Enhanced:
             let packs = "https://github.com/tarikbc/macgames/releases/download/packs-1/"
             return [
-                ProfileDownload(url: URL(string: "https://github.com/tarikbc/macgames/releases/download/v0.1.6/MacGames-0.1.6.zip")!, fileName: "MacGames-0.1.6.zip",
-                                sha256: "c236645a868ef708df43705cdce521c951b710166da0fb2d9186bc6da82c5f94", size: 154_946_645),
+                ProfileDownload(url: URL(string: "https://github.com/rofrol/Portnaut/releases/download/\(Self.engineRelease)/\(Self.engineRelease).tar.xz")!,
+                                fileName: "\(Self.engineRelease).tar.xz", sha256: Self.engineSHA256),
                 ProfileDownload(url: URL(string: "https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.15.tar.xz")!, fileName: "Template-1.0.15.tar.xz",
                                 sha256: "34273bcce885ce5a7fd6937af9ea344bb9961de7d55d6193f7413142e835c8c3"),
-                ProfileDownload(url: URL(string: packs + "macgames-pack-gta5.tar.xz")!, fileName: "macgames-pack-gta5.tar.xz",
-                                sha256: "bc8d15d5ad6713e6a192de6d78e0534a2925db886d7a9225efdf52c25fcc7499", size: 134_419_392),
-                ProfileDownload(url: URL(string: packs + "macgames-pack-rockstar.tar.xz")!, fileName: "macgames-pack-rockstar.tar.xz",
-                                sha256: "6757715792fe378758ef880ee9a433882ab6083044928ba1befbdda6f8598639", size: 728_072),
                 ProfileDownload(url: URL(string: packs + "macgames-pack-\(Self.d3dmetalPack).tar.xz")!, fileName: "macgames-pack-\(Self.d3dmetalPack).tar.xz",
                                 sha256: "209a9203864a0618d686096162f75ce506838fcfe3a715b997f87759dbbee02e", size: 15_870_444),
             ]
@@ -69,12 +64,35 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
 
     var engineArchive: String { downloads[0].fileName }
     var templateArchive: String { downloads[1].fileName }
-    /// MacGames packs unpacked under packs/, and the overlays from them copied over the engine.
-    var packs: [String] { ["gta5", "rockstar", Self.d3dmetalPack] }
-    var overlays: [String] { ["gta5"] }
+    /// MacGames packs unpacked under packs/.
+    var packs: [String] { [Self.d3dmetalPack] }
 
-    /// Written into the built profile; a different value rebuilds it.
-    var marker: String { "\(rawValue)-v1:" + downloads.map(\.sha256).joined(separator: "+") }
+    /// The engine release built by the fork's build-gta5-wine workflow, and its archive's SHA-256.
+    static let engineRelease = "gta5-wine-11.13-local"
+    static let engineSHA256 = "c2e3ed2d47d18ca780c0d15a8cb883e6ad209d264161ddb83672c6519c892398"
+
+    /// Links the engine gets to D3DMetal, relative to engine/, with their targets in the renderer layout
+    /// linkTarget resolves, each replacing the engine's own file: D3DMetal's dxgi, d3d11 and d3d12 builtins
+    /// with their Unix side, and the atidxx64 builtin, which GTA5_Enhanced.exe loads (the registry below).
+    /// Wine looks for a builtin in the engine's own lib/wine before WINEDLLPATH (init_paths' dll_paths in
+    /// dlls/ntdll/unix/loader.c), so the game gets D3DMetal only from here; Wine's own d3d11, dxgi and
+    /// d3d10core reach the launcher as native copies in system32. These are the D3DMetal entries of MacGames
+    /// 0.1.6's Runtime/dependency-links.json; its library entries are not needed, as the bottle's
+    /// DYLD_FALLBACK_LIBRARY_PATH reaches the template's libraries.
+    static let engineLinks: [(link: String, target: String)] = [
+        ("lib/wine/x86_64-unix/atidxx64.so", "renderer/d3dmetal/external/libd3dshared.dylib"),
+        ("lib/wine/x86_64-unix/d3d11.so", "renderer/d3dmetal/external/libd3dshared.dylib"),
+        ("lib/wine/x86_64-unix/d3d12.so", "renderer/d3dmetal/external/libd3dshared.dylib"),
+        ("lib/wine/x86_64-unix/dxgi.so", "renderer/d3dmetal/external/libd3dshared.dylib"),
+        ("lib/wine/x86_64-windows/atidxx64.dll", "renderer/d3dmetal/wine/x86_64-windows/atidxx64.dll"),
+        ("lib/wine/x86_64-windows/d3d11.dll", "renderer/d3dmetal/wine/x86_64-windows/d3d11.dll"),
+        ("lib/wine/x86_64-windows/d3d12.dll", "renderer/d3dmetal/wine/x86_64-windows/d3d12.dll"),
+        ("lib/wine/x86_64-windows/dxgi.dll", "renderer/d3dmetal/wine/x86_64-windows/dxgi.dll"),
+    ]
+
+    /// Written into the built profile; a different value rebuilds it. The version names how the profile is
+    /// assembled (engineLinks, layout): change it with them, as the downloads' hashes do not.
+    var marker: String { "\(rawValue)-v2:" + downloads.map(\.sha256).joined(separator: "+") }
 
     // MARK: - Layout
 
@@ -82,13 +100,15 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
     public struct Layout: Sendable {
         public let root: URL
         public var engine: URL { root.appendingPathComponent("engine") }
+        /// The engine release's WineD3D d3d11, dxgi and d3d10core without Wine's builtin mark.
+        public var launcherWineD3D: URL { root.appendingPathComponent("launcher-wined3d") }
         public var frameworks: URL { root.appendingPathComponent("deps/Frameworks") }
         public func pack(_ name: String) -> URL { root.appendingPathComponent("packs/\(name)") }
         public var d3dmetal: URL { pack(EngineProfile.d3dmetalPack) }
         public var markerFile: URL { root.appendingPathComponent(".portnaut-engine-profile") }
     }
 
-    /// Where a dependency link of MacGames' engine points, relative to the profile's root: a D3DMetal file
+    /// Where an engine link (engineLinks) points, relative to the profile's root: a D3DMetal file
     /// from the pinned D3DMetal pack when the pack has it (its DLLs and libd3dshared must come from one
     /// D3DMetal), otherwise the template's file. Mirrors MacGames' EngineInstaller.ownD3DMetal.
     static func linkTarget(_ target: String, d3dmetalHas: (String) -> Bool) -> String {
@@ -123,7 +143,9 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
         env["WINEMSYNC"] = "0"
         env["WINEESYNC"] = "0"
         env["WINEDLLOVERRIDES"] = "winemenubuilder.exe=;mscoree,mshtml=;gameoverlayrenderer,gameoverlayrenderer64=;nvapi64,nvngx="
-        // D3DMetal's builtins first, for the game; the launcher takes WineD3D from system32 (native,builtin).
+        // Wine searches the engine's own lib/wine first, so D3DMetal's dxgi, d3d11 and d3d12 are linked into it
+        // (engineLinks); this path adds only what the engine lacks, D3DMetal's nvapi64 and nvngx (turned off by
+        // the overrides above). The launcher takes WineD3D from system32 (native,builtin).
         env["WINEDLLPATH"] = layout.d3dmetal.appendingPathComponent("wine").path + ":" + layout.engine.appendingPathComponent("lib/wine").path
         env["WINEDEBUG"] = ProcessInfo.processInfo.environment["PORTNAUT_WINEDEBUG"] ?? "-all,err+all"
         env["DYLD_FALLBACK_LIBRARY_PATH"] = [layout.frameworks.path, gst.path, "/usr/lib"].joined(separator: ":")
@@ -178,11 +200,11 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
     }
 
     /// Files copied into the prefix's system32, later ones replacing earlier ones: D3DMetal's dxgi, d3d11
-    /// and d3d12 and the template's atidxx64, then the rockstar pack's WineD3D d3d11, dxgi and d3d10core.
+    /// and d3d12 and the template's atidxx64, then the engine release's WineD3D d3d11, dxgi and d3d10core.
     func systemCopies(layout: Layout) -> [(from: URL, name: String)] {
         let d3dmetal = layout.d3dmetal.appendingPathComponent("wine/x86_64-windows")
         let template = layout.frameworks.appendingPathComponent("renderer/d3dmetal/wine/x86_64-windows")
-        let wined3d = layout.pack("rockstar").appendingPathComponent("RockstarRenderer")
+        let wined3d = layout.launcherWineD3D
         return ["dxgi", "d3d11", "d3d12"].map { (d3dmetal.appendingPathComponent("\($0).dll"), "\($0).dll") }
             + [(template.appendingPathComponent("atidxx64.dll"), "atidxx64.dll")]
             + ["d3d11", "dxgi", "d3d10core"].map { (wined3d.appendingPathComponent("\($0).dll"), "\($0).dll") }

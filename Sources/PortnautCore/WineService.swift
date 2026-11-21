@@ -173,8 +173,7 @@ public final class WineService: @unchecked Sendable {
                 try fm.createDirectory(at: folder, withIntermediateDirectories: true)
                 try await ProcessRunner.run(tar, ["-xf", archive.path, "-C", folder.path] + members, log: paths.setupLog, timeout: nil)
             }
-            try await unpack(profile.engineArchive, into: sources, [EngineProfile.macGamesApp + "/Engine", EngineProfile.macGamesApp + "/dependency-links.json"])
-            try fm.moveItem(at: sources.appendingPathComponent(EngineProfile.macGamesApp + "/Engine"), to: staged.engine)
+            try await unpack(profile.engineArchive, into: stage, ["engine", "launcher-wined3d"])
             try await unpack(profile.templateArchive, into: sources, [EngineProfile.templateApp])
             try fm.createDirectory(at: staged.frameworks.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.moveItem(at: sources.appendingPathComponent(EngineProfile.templateApp), to: staged.frameworks)
@@ -182,22 +181,23 @@ public final class WineService: @unchecked Sendable {
                 try await unpack("macgames-pack-\(pack).tar.xz", into: stage.appendingPathComponent("packs"))
                 guard fm.fileExists(atPath: staged.pack(pack).path) else { throw PortnautError("The \(pack) pack has an unexpected layout.") }
             }
-            for overlay in profile.overlays {
-                let folder = profile.packs.lazy.map { staged.pack($0).appendingPathComponent("Overlays/\(overlay)") }.first { fm.fileExists(atPath: $0.path) }
-                guard let folder else { throw PortnautError("\(profile.title) lacks the \(overlay) overlay.") }
-                try await ProcessRunner.run(URL(fileURLWithPath: "/usr/bin/ditto"), ["--noextattr", "--norsrc", folder.path, staged.engine.path], log: paths.setupLog, timeout: nil)
-            }
-            // The engine reaches its libraries and D3DMetal through these links; a file an overlay ships stays.
-            let links = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: sources.appendingPathComponent(EngineProfile.macGamesApp + "/dependency-links.json")))
-            for (relative, target) in links.sorted(by: { $0.key < $1.key }) {
+            // The engine reaches D3DMetal through these links, which replace the engine's own files.
+            for (relative, target) in EngineProfile.engineLinks {
                 let link = staged.engine.appendingPathComponent(relative)
-                if fm.fileExists(atPath: link.path) || (try? fm.destinationOfSymbolicLink(atPath: link.path)) != nil { continue }
+                var isFolder: ObjCBool = false
+                if fm.fileExists(atPath: link.path, isDirectory: &isFolder) || (try? fm.destinationOfSymbolicLink(atPath: link.path)) != nil {
+                    guard !isFolder.boolValue else { throw PortnautError("\(profile.title)'s engine has a folder at \(relative).") }
+                    try fm.removeItem(at: link)
+                }
                 let destination = EngineProfile.linkTarget(target) { fm.fileExists(atPath: staged.d3dmetal.appendingPathComponent($0).path) }
                 guard fm.fileExists(atPath: stage.appendingPathComponent(destination).path) else { throw PortnautError("\(profile.title) lacks \(target).") }
                 try fm.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.createSymbolicLink(atPath: link.path, withDestinationPath: EngineProfile.relativeLink(from: "engine/" + relative, to: destination))
             }
             try fm.removeItem(at: sources)
+            for copy in profile.systemCopies(layout: staged) where !fm.fileExists(atPath: copy.from.path) {
+                throw PortnautError("\(profile.title) lacks \(copy.from.lastPathComponent) for system32.")
+            }
             try await ProcessRunner.run(staged.engine.appendingPathComponent("bin/wine"), ["--version"], log: paths.setupLog, timeout: nil)
             try Data(profile.marker.utf8).write(to: staged.markerFile, options: .atomic)
             // The profile it replaces goes aside first and comes back if the new one cannot move into place.
