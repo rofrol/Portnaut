@@ -511,6 +511,9 @@ public final class WineService: @unchecked Sendable {
             do {
                 try await ProcessRunner.run(paths.wine(for: bottle), ["wineboot", "-u"], environment: environment(for: bottle), log: paths.setupLog, timeout: 180)
                 try isolateUserFolders(bottlePaths)
+                // wineboot's server outlives it briefly; a new environment has no programs of the user's, so
+                // wait for it to exit, as applyEngine changes the engine only while no server runs.
+                try await ProcessRunner.run(paths.wineserver(for: bottle), ["-w"], environment: environment(for: bottle), log: paths.setupLog, timeout: nil)
             } catch {
                 try? await stop(bottle)
                 throw error
@@ -643,9 +646,22 @@ public final class WineService: @unchecked Sendable {
     /// the profile's files in system32 and the registry profile, then the record that says so. `saving` saves the
     /// bottle once all of that applied, so an engine switch is saved only when complete; a failure leaves the
     /// record changing, and the next start (requireEngine) or save repeats this, as every step can be repeated.
+    /// A prefix already on its engine only gets the registry profile imported, also into a running session
+    /// (settings apply to the next programs started).
     func applyEngine(_ bottle: Bottle, saving: Bool = false) async throws {
         let bottlePaths = paths.bottle(bottle)
         let target = bottle.engineProfile
+        if try engineInPlace(for: bottle) {
+            try await importProfile(of: bottle)
+            if saving { try save(bottle) }
+            return
+        }
+        // Changing the engine replaces files and values programs of a running session use, and the record may
+        // say applied only once the registry is on disk, which a running server keeps in memory. A program
+        // started outside Portnaut after this check is not seen; nothing can lock those out.
+        if try await serverRunning(for: bottle) {
+            throw PortnautError("Quit the Windows programs running in \(bottle.name) first, then try again.")
+        }
         // A prefix set up before records existed holds the profile whose backup is there (at most one then, as
         // EngineProfile had one case). Migration for the gta5-enhanced bottle, recordless when records came;
         // remove it once no recordless prefix is left.
@@ -665,17 +681,55 @@ public final class WineService: @unchecked Sendable {
         try mapRuntimeDrive(bottlePaths, to: target.map { paths.profile($0).root } ?? paths.runtime)
         if let leaving { try restoreFiles(of: leaving, to: bottlePaths) }
         if let target { try applyFiles(of: target, to: bottlePaths) }
-        try await importProfile(of: bottle, leaving: leaving)
+        // The import ends with a stamp new to this change in both hives it writes. Wine's server holds the
+        // registry in memory and writes each hive whole (a temporary file renamed) when it exits, so the stamp
+        // in a hive on disk shows the whole import reached that hive. A server killed before writing also ends
+        // the wait, which is why the files are read, not the wait trusted.
+        let stamp = UUID().uuidString
+        try await importProfile(of: bottle, leaving: leaving, stamp: stamp)
+        try await ProcessRunner.run(paths.wineserver(for: bottle), ["-w"], environment: environment(for: bottle), log: paths.setupLog, timeout: nil)
+        for hive in ["user.reg", "system.reg"] {
+            let text = (try? String(contentsOf: bottlePaths.prefix.appendingPathComponent(hive), encoding: .utf8)) ?? ""
+            guard text.contains("\"\(Self.engineStampValue)\"=\"\(stamp)\"") else {
+                throw PortnautError("Wine did not save \(bottle.name)’s registry (\(hive)). Try again; Portnaut repeats the change at the next start.")
+            }
+        }
         if saving { try save(bottle) }
         try writeEngineState(.applied(target), in: bottlePaths)
         if let leaving { try discardBackup(of: leaving, in: bottlePaths) }
     }
 
-    /// Writes and imports the bottle's registry profile; `leaving` names the engine profile whose values go first.
-    func importProfile(of bottle: Bottle, leaving: EngineProfile? = nil) async throws {
+    static let engineStampValue = "EngineStamp"
+
+    /// Whether the record says the bottle's engine is applied and drive Y: points at that engine.
+    func engineInPlace(for bottle: Bottle) throws -> Bool {
+        let bottlePaths = paths.bottle(bottle)
+        let driveY = try? FileManager.default.destinationOfSymbolicLink(atPath: bottlePaths.prefix.appendingPathComponent("dosdevices/\(Self.runtimeDrive):").path)
+        let engine = bottle.engineProfile.map { paths.profile($0).root } ?? paths.runtime
+        return try engineState(in: bottlePaths) == .applied(bottle.engineProfile) && driveY == engine.path
+    }
+
+    /// Whether a Wine server runs for the bottle's prefix. `wineserver -k0` sends signal 0 to the server holding
+    /// the prefix's lock and exits 0 when one does, 1 when none does or when no server could start for this
+    /// prefix (no prefix folder, one not owned by this user, no server folder; fatal_error exits 1); Wine 11.13
+    /// server/main.c and request.c kill_lock_owner. The lock is found from the prefix alone, so any engine's
+    /// wineserver sees another engine's server. Anything else (a crash) is not taken as "none".
+    func serverRunning(for bottle: Bottle) async throws -> Bool {
+        let status = try await ProcessRunner.run(paths.wineserver(for: bottle), ["-k0"], environment: environment(for: bottle), log: paths.setupLog,
+                                                 timeout: nil, allowFailure: true)
+        guard status == 0 || status == 1 else { throw PortnautError("Portnaut could not check whether \(bottle.name) is in use (wineserver exited with \(status)).") }
+        return status == 0
+    }
+
+    /// Writes and imports the bottle's registry profile; `leaving` names the engine profile whose values go first,
+    /// and `stamp`, when given, is set last in both hives the profile writes.
+    func importProfile(of bottle: Bottle, leaving: EngineProfile? = nil, stamp: String? = nil) async throws {
         let directory = paths.bottle(bottle).drive.appendingPathComponent("Portnaut")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data(Self.profile(for: bottle, leaving: leaving).utf8).write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
+        let stamps = stamp.map { stamp in
+            ["HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"].map { "[\($0)\\Software\\Portnaut]\n\"\(Self.engineStampValue)\"=\"\(stamp)\"\n\n" }.joined()
+        } ?? ""
+        try Data((Self.profile(for: bottle, leaving: leaving) + stamps).utf8).write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
         try await ProcessRunner.run(paths.wine(for: bottle), ["reg", "import", "C:\\Portnaut\\profile.reg"], environment: environment(for: bottle),
                                     directory: paths.bottle(bottle).drive, log: paths.setupLog, timeout: 30)
     }
@@ -849,11 +903,8 @@ public final class WineService: @unchecked Sendable {
         if let profile = saved.engineProfile, !paths.profileReady(profile) {
             throw PortnautError("\(profile.title) is not prepared. Choose Repair All Bottles in Setup to build it.")
         }
-        let bottlePaths = paths.bottle(saved)
-        let driveY = try? FileManager.default.destinationOfSymbolicLink(atPath: bottlePaths.prefix.appendingPathComponent("dosdevices/\(Self.runtimeDrive):").path)
-        let engine = saved.engineProfile.map { paths.profile($0).root } ?? paths.runtime
-        if try engineState(in: bottlePaths) != .applied(saved.engineProfile) || driveY != engine.path { try await applyEngine(saved) }
-        if saved.engineProfile != nil { try writeGameArguments(to: bottlePaths) }
+        if try !engineInPlace(for: saved) { try await applyEngine(saved) }
+        if saved.engineProfile != nil { try writeGameArguments(to: paths.bottle(saved)) }
     }
 
     /// Runs a program of the bottle's drive and returns its exit code, by default after the whole session ends.

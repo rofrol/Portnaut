@@ -184,13 +184,24 @@ struct EngineProfileTests {
         try service.paths.createDirectories()
         return (root, service)
     }
-    /// A Wine that exits with `exitCode`, or fails only the `failing` command (as `reg`).
-    func fakeWine(_ url: URL, exitCode: Int = 0, failing: String? = nil) throws {
+    /// A Wine (or wineserver) that exits with `exitCode`, or fails only the `failing` command (as `reg`). Its
+    /// `reg import` counts itself in reg-calls and keeps each hive's stamp line in memory (a pending file per
+    /// hive: HKEY_CURRENT_USER's for user.reg, HKEY_LOCAL_MACHINE's for system.reg); its `wineserver -w` writes
+    /// them to `savedHives`, as Wine's server writes each hive on exit (none: a server killed first). `-k0`
+    /// exits with `probeStatus` (0: a server runs, 1: none).
+    func fakeWine(_ url: URL, exitCode: Int = 0, failing: String? = nil, savedHives: [String] = ["user.reg", "system.reg"], probeStatus: Int = 1) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // wineboot creates the folders prepareBottle's later steps use.
         let wineboot = "[ \"$1\" = wineboot ] && mkdir -p \"$WINEPREFIX/dosdevices\" \"$WINEPREFIX/drive_c/windows/system32\"\n"
         let failure = failing.map { "[ \"$1\" = \($0) ] && exit 1\n" } ?? ""
-        try Data("#!/bin/sh\n\(wineboot)\(failure)exit \(exitCode)\n".utf8).write(to: url)
+        let probe = "[ \"$1\" = -k0 ] && exit \(probeStatus)\n"
+        let profile = "\"$WINEPREFIX/drive_c/Portnaut/profile.reg\""
+        let keep = { (root: String, hive: String) in
+            "grep -F -A1 '[\(root)\\Software\\Portnaut]' \(profile) | grep '\"EngineStamp\"' >> \"$WINEPREFIX/in-memory.\(hive)\""
+        }
+        let registry = "[ \"$1\" = reg ] && { echo reg >> \"$WINEPREFIX/reg-calls\"; \(keep("HKEY_CURRENT_USER", "user.reg")); \(keep("HKEY_LOCAL_MACHINE", "system.reg")); }\n"
+            + "[ \"$1\" = -w ] && { for hive in \(savedHives.joined(separator: " ")); do cat \"$WINEPREFIX/in-memory.$hive\" >> \"$WINEPREFIX/$hive\" 2>/dev/null; done; rm -f \"$WINEPREFIX\"/in-memory.*; }\n"
+        try Data("#!/bin/sh\n\(wineboot)\(probe)\(failure)\(registry)exit \(exitCode)\n".utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
     func fakeRuntime(_ service: WineService) throws {
@@ -402,6 +413,61 @@ struct EngineProfileTests {
         #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path))
         #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains(EngineProfile.gta5Enhanced.cleanupRegistry) == true)
         #expect(try FileManager.default.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut/engine-backup").path).isEmpty)
+    }
+
+    /// A switch whose registry Wine's server never wrote to disk (killed before it exited) is not recorded as
+    /// applied nor saved, whatever the import and the wait for the server returned; the next start repeats it.
+    @Test func aSwitchIsRecordedOnlyOnceTheRegistryIsOnDisk() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let profileServer = service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wineserver")
+        bottle.engineProfile = .gta5Enhanced
+        for saved in [[], ["user.reg"], ["system.reg"]] {
+            try fakeWine(profileServer, savedHives: saved)
+            await #expect(throws: (any Error).self) { try await service.update(bottle) }
+            #expect(try service.bottle(bottle.id).engineProfile == nil)
+            #expect(try service.engineState(in: bottlePaths) == .changing(holding: .gta5Enhanced))
+        }
+        try fakeWine(profileServer)
+        try await service.update(bottle)
+        #expect(try service.bottle(bottle.id).engineProfile == .gta5Enhanced)
+        #expect(try service.engineState(in: bottlePaths) == .applied(.gta5Enhanced))
+    }
+
+    /// An engine change while a Wine server runs in the prefix is refused before it touches anything; a settings
+    /// save on the engine the prefix is on still imports into the running session.
+    @Test func anEngineChangeWaitsForTheBottlesProgramsToQuit() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try await service.update(bottle)
+        #expect(try service.engineState(in: bottlePaths) == .applied(nil))
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        var switched = bottle
+        switched.engineProfile = .gta5Enhanced
+        // 0: a server runs; anything but 0 or 1: the probe could not tell, which is not taken as "none".
+        for status in [0, 2] {
+            for renderer in Renderer.allCases { try fakeWine(service.paths.wineserver(for: renderer), probeStatus: status) }
+            try fakeWine(service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wineserver"), probeStatus: status)
+            await #expect(throws: (any Error).self) { try await service.update(switched) }
+            #expect(try service.engineState(in: bottlePaths) == .applied(nil))
+            #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent("d3d12.dll").path))
+            #expect(try service.bottle(bottle.id).engineProfile == nil)
+        }
+        let imports = { (self.contents(bottlePaths.prefix.appendingPathComponent("reg-calls")) ?? "").split(separator: "\n").count }
+        let importsBefore = imports()
+        bottle.windowsVersion = .win7
+        try await service.update(bottle)
+        #expect(imports() == importsBefore + 1)
+        #expect(try service.bottle(bottle.id).windowsVersion == .win7)
+        #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains("\"Version\"=\"\(WindowsVersion.win7.rawValue)\"") == true)
     }
 
     /// Where a switch can fail part-way, and how to make it fail there and undo that.
