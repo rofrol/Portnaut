@@ -442,7 +442,9 @@ struct EngineProfileTests {
         } else {
             #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
             #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
-            #expect(registry.hasSuffix(EngineProfile.gta5Enhanced.registry))
+            // The profile's values come last, after a game's; an engine change's stamp follows in its own key.
+            let values = registry.components(separatedBy: "[HKEY_CURRENT_USER\\Software\\Portnaut]")[0]
+            #expect(values.hasSuffix(EngineProfile.gta5Enhanced.registry))
         }
     }
 
