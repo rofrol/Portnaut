@@ -470,6 +470,39 @@ struct EngineProfileTests {
         #expect(contents(bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg"))?.contains("\"Version\"=\"\(WindowsVersion.win7.rawValue)\"") == true)
     }
 
+    /// Settings saved into a running session reach the prefix only when its server writes the hives, which a
+    /// killed server never does; so every start Portnaut makes imports the saved bottle's registry profile
+    /// again, on the engine the prefix is already on too.
+    @Test func everyStartImportsTheSavedSettings() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try await service.update(bottle)
+        bottle.windowsVersion = .win7
+        try await service.update(bottle)
+        let profile = bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg")
+        try FileManager.default.removeItem(at: profile)
+        let imports = { (self.contents(bottlePaths.prefix.appendingPathComponent("reg-calls")) ?? "").split(separator: "\n").count }
+        for _ in 0..<2 {
+            let importsBefore = imports()
+            try await service.requireEngine(of: bottle)
+            #expect(imports() == importsBefore + 1)
+        }
+        #expect(contents(profile)?.contains("\"Version\"=\"\(WindowsVersion.win7.rawValue)\"") == true)
+        // A start whose import fails does not go on with settings the prefix may not have.
+        // The profile written again shows the start got as far as the import, the step that fails.
+        try fakeWine(service.paths.wine(for: bottle.renderer), failing: "reg")
+        try FileManager.default.removeItem(at: profile)
+        await #expect(throws: (any Error).self) { try await service.requireEngine(of: bottle) }
+        #expect(FileManager.default.fileExists(atPath: profile.path))
+    }
+
     /// Where a switch can fail part-way, and how to make it fail there and undo that.
     enum SwitchFailure: CaseIterable {
         case driveY, files, registry, save

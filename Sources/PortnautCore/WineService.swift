@@ -647,7 +647,7 @@ public final class WineService: @unchecked Sendable {
     /// bottle once all of that applied, so an engine switch is saved only when complete; a failure leaves the
     /// record changing, and the next start (requireEngine) or save repeats this, as every step can be repeated.
     /// A prefix already on its engine only gets the registry profile imported, also into a running session
-    /// (settings apply to the next programs started).
+    /// (settings apply to the next programs started; requireEngine imports again at each start).
     func applyEngine(_ bottle: Bottle, saving: Bool = false) async throws {
         let bottlePaths = paths.bottle(bottle)
         let target = bottle.engineProfile
@@ -902,7 +902,9 @@ public final class WineService: @unchecked Sendable {
     /// are prepared, the prefix is on the saved engine (a switch that failed part-way, a bottle without a
     /// record, or a drive Y: elsewhere, as in a snapshot from another Portnaut folder, is brought to it here,
     /// and a failure to do so stops the start), the caller's bottle names that engine, so its Wine is the
-    /// one the prefix is on, and a profile bottle's game has its arguments.
+    /// one the prefix is on, the saved settings' registry profile is imported (a save into a running session
+    /// reaches the hives only if its server writes them, which a killed one never does, so each start imports
+    /// again; the import is repeatable), and a profile bottle's game has its arguments.
     func requireEngine(of bottle: Bottle) async throws {
         guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
         let saved = try self.bottle(bottle.id)
@@ -910,7 +912,7 @@ public final class WineService: @unchecked Sendable {
         if let profile = saved.engineProfile, !paths.profileReady(profile) {
             throw PortnautError("\(profile.title) is not prepared. Choose Repair All Bottles in Setup to build it.")
         }
-        if try !engineInPlace(for: saved) { try await applyEngine(saved) }
+        try await applyEngine(saved)
         if saved.engineProfile != nil { try writeGameArguments(to: paths.bottle(saved)) }
     }
 
