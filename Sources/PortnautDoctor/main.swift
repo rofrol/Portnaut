@@ -13,6 +13,8 @@ struct PortnautDoctor {
       analyze <path/to/program.exe>           graphics APIs and the recommended renderer
       create <name> [launcher] [renderer]     new bottle; launcher: \(Launcher.allCases.map(\.rawValue).joined(separator: "|")); renderer: \(Renderer.allCases.map(\.rawValue).joined(separator: "|"))
       renderer [bottle] <renderer>            switch a bottle's renderer
+      rename [bottle] <name>                  rename a bottle (its folder and id stay)
+      remove <bottle>                         stop a bottle and move it to the Trash
       prepare-engine <profile>                download, check and build an engine profile
       engine [bottle] <profile>|off           replace the bottle's Wine and renderer with an engine profile: \(EngineProfile.allCases.map(\.rawValue).joined(separator: "|"))
       add-game [bottle] <path/to/program.exe> add a program inside the bottle as a game
@@ -347,6 +349,17 @@ struct PortnautDoctor {
                 try await service.refreshCompatibility()
                 print("Compatibility database: \(service.compatibilityDatabase().map { "\($0.reports.count) games, generated \($0.generated)" } ?? "not readable")")
             case "stop": try await service.stop(try target(service, arguments))
+            case "rename":
+                guard let name = arguments.last?.trimmingCharacters(in: .whitespaces), !name.isEmpty else { throw PortnautError(usage) }
+                var bottle = try target(service, arguments.dropLast())
+                bottle.name = name
+                try await service.update(bottle)
+                print("\(bottle.id): \(bottle.name)")
+            case "remove":
+                guard !arguments.isEmpty else { throw PortnautError(usage) }
+                let bottle = try target(service, arguments)
+                try await service.removeBottle(bottle)
+                print("\(bottle.name) is in the Trash")
             default: throw PortnautError(usage)
             }
         } catch {
