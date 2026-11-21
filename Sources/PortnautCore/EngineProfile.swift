@@ -35,6 +35,13 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
         }
     }
 
+    /// Why a bottle of the profile's launcher should use it, shown while the bottle is on Portnaut's Wine.
+    public var recommendationReason: String {
+        switch self {
+        case .gta5Enhanced: "The Rockstar Games Launcher signs in and GTA V Enhanced plays on it, with voices (tested on an M1 Pro). On Portnaut’s Wine the launcher does not start on D3DMetal, and GTA V Enhanced needs DirectX 12."
+        }
+    }
+
     /// Shown wherever the profile can be chosen: the parts' own licences apply.
     public var licenseNote: String {
         switch self {

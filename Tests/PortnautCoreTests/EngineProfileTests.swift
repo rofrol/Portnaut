@@ -144,6 +144,12 @@ struct EngineProfileTests {
         #expect(URL(fileURLWithPath: "../../../../packs/x/dxgi.dll", relativeTo: base).standardizedFileURL.path == "/root/packs/x/dxgi.dll")
     }
 
+    /// Rockstar bottles are pointed at the engine profile; no other launcher has one.
+    @Test func onlyRockstarBottlesRecommendTheEngineProfile() {
+        #expect(Launcher.rockstar.engineProfile == .gta5Enhanced)
+        #expect(Launcher.allCases.filter { $0.engineProfile != nil } == [.rockstar])
+    }
+
     @Test func commandLineKeepsTheUsersArgumentsAndAddsEachRequiredOnce() {
         #expect(EngineProfile.commandLine(merging: nil) == "-disableSpatialAudioClient\n-nobattleye\n")
         #expect(EngineProfile.commandLine(merging: "-windowed\n-nobattleye\n") == "-windowed\n-nobattleye\n-disableSpatialAudioClient\n")

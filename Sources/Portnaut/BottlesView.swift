@@ -110,7 +110,18 @@ struct BottleDetail: View {
                         ForEach(Renderer.allCases) { Text($0.title).tag($0) }
                     }.pickerStyle(.segmented).labelsHidden().disabled(running || model.busy)
                     Text(bottle.renderer.detail).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-                    if let recommendation {
+                    if let profile = bottle.launcher?.engineProfile {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "lightbulb").foregroundStyle(Palette.accent)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Recommended: \(profile.title)").font(.system(size: 12, weight: .semibold))
+                                Text(profile.recommendationReason).font(.system(size: 12)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                            Button("Use This Engine") { binding(\.engineProfile, fallback: bottle).wrappedValue = profile }
+                                .buttonStyle(PortnautButtonStyle(primary: true)).frame(height: 28).disabled(running || model.busy)
+                        }.padding(12).background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 9))
+                    } else if let recommendation {
                         HStack(alignment: .top, spacing: 10) {
                             Image(systemName: recommendation.renderer == bottle.renderer ? "checkmark.seal" : "lightbulb")
                                 .foregroundStyle(recommendation.renderer == bottle.renderer ? Palette.cyan : Palette.accent)
@@ -129,7 +140,7 @@ struct BottleDetail: View {
                         Label(note, systemImage: "doc.text").font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
                     }
                     if let launcher = bottle.launcher, launcher.unsupportedRenderers.contains(bottle.renderer) {
-                        Label("\(launcher.title) does not start properly on \(bottle.renderer.title) (tested). Use \(launcher.recommendation.renderer.title).", systemImage: "exclamationmark.triangle")
+                        Label("\(launcher.title) does not start properly on \(bottle.renderer.title) (tested). Use \(launcher.engineProfile.map { "the \($0.title) engine" } ?? launcher.recommendation.renderer.title).", systemImage: "exclamationmark.triangle")
                             .font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.accent).fixedSize(horizontal: false, vertical: true)
                     }
                     if bottle.renderer == .dxmt {

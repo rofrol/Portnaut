@@ -152,6 +152,13 @@ public enum Launcher: String, Codable, CaseIterable, Sendable, Identifiable {
         case .steam, .ea, .epic, .battlenet, .amazon: []
         }
     }
+    /// The engine profile recommended over every renderer of Portnaut's Wine for this launcher's bottles.
+    public var engineProfile: EngineProfile? {
+        switch self {
+        case .rockstar: .gta5Enhanced
+        case .steam, .ea, .epic, .battlenet, .ubisoft, .gog, .amazon: nil
+        }
+    }
     /// A recommendation for a game or bottle of this launcher, kept to renderers the launcher starts on.
     public func adjusted(_ recommendation: Recommendation) -> Recommendation {
         unsupportedRenderers.contains(recommendation.renderer) ? self.recommendation : recommendation
