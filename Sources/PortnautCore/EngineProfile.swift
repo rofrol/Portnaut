@@ -76,8 +76,8 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
     var d3dmetalArchive: String { downloads[2].fileName }
 
     /// The engine release built by the fork's build-gta5-wine workflow, and its archive's SHA-256.
-    static let engineRelease = "gta5-wine-11.13-local"
-    static let engineSHA256 = "c2e3ed2d47d18ca780c0d15a8cb883e6ad209d264161ddb83672c6519c892398"
+    static let engineRelease = "gta5-wine-11.13-8c2133a8baac-r3"
+    static let engineSHA256 = "da363c8f004cd21e9a635d0511274612a86207eccabf77837130f1d86da54619"
 
     /// Links the engine gets to D3DMetal, relative to engine/, with their targets in the renderer layout
     /// linkTarget resolves, each replacing the engine's own file: D3DMetal's dxgi, d3d11 and d3d12 builtins
