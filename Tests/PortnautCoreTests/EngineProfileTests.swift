@@ -929,17 +929,19 @@ struct EngineProfileTests {
     /// The bottle is whole on the engine its saved choice names: expectOnEngine, the record, the symbolic link
     /// original kept as a link (in system32 off the profile, in the backup on it), and no leftovers of a change.
     /// Off the profile, a backup may remain (a leave stopped after its record said applied); it holds no
-    /// originals, so entering and leaving again must give the same originals back.
+    /// originals, so entering and leaving again must give the same originals back. On the profile, leaving
+    /// must give them back from the backup.
     func expectRecovered(_ service: WineService, _ bottlePaths: BottlePaths, _ context: String) async throws {
         try expectWhole(service, bottlePaths, context)
         var bottle = try service.bottle(gtaBottle().id)
-        guard bottle.engineProfile == nil else { return }
-        bottle.engineProfile = .gta5Enhanced
-        try await service.update(bottle)
-        try expectWhole(service, bottlePaths, context + ", entered again")
+        if bottle.engineProfile == nil {
+            bottle.engineProfile = .gta5Enhanced
+            try await service.update(bottle)
+            try expectWhole(service, bottlePaths, context + ", entered again")
+        }
         bottle.engineProfile = nil
         try await service.update(bottle)
-        try expectWhole(service, bottlePaths, context + ", left again")
+        try expectWhole(service, bottlePaths, context + ", left")
         #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path), "\(context)")
     }
     func expectWhole(_ service: WineService, _ bottlePaths: BottlePaths, _ context: String) throws {
@@ -951,29 +953,34 @@ struct EngineProfileTests {
             ? bottlePaths.drive.appendingPathComponent("windows/system32/d3d10core.dll")
             : service.engineBackup(of: .gta5Enhanced, in: bottlePaths).appendingPathComponent("d3d10core.dll")
         #expect((try? fm.destinationOfSymbolicLink(atPath: link.path)) == "elsewhere.dll", "\(context)")
-        if saved != nil { #expect(fm.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path), "\(context)") }
+        if let saved {
+            #expect(try service.engineBackupNames(of: saved, in: bottlePaths)?.all == Set(saved.systemNames(layout: service.paths.profile(saved))), "\(context)")
+            #expect(contents(bottlePaths.drive.appendingPathComponent("windows/system32/d3d10core.dll"))?.contains("launcher-wined3d") == true, "\(context)")
+        }
         let left = try fm.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut").path)
         #expect(left.allSatisfy { !$0.hasPrefix(".engine-backup-") && !$0.contains(Durable.temporaryMark) }, "\(context): \(left)")
     }
 
-    /// Ends this process with exit code `code` at the change's `n`th step (barriers are not counted).
+    /// Ends this process with exit code `code` at the change's `n`th step (barriers are not counted); with
+    /// `expected`, only when that step is the one named, and with `StepStop.otherStep` when another one is there.
     final class StepStop: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
-        let n: Int, code: Int32
-        init(at n: Int, code: Int32) { self.n = n; self.code = code }
+        let n: Int, code: Int32, expected: String?
+        static let otherStep: Int32 = 44
+        init(at n: Int, expecting expected: String? = nil, code: Int32) { self.n = n; self.expected = expected; self.code = code }
         func reach(_ step: String) {
             guard !step.hasPrefix("sync:") else { return }
             lock.lock(); count += 1; let reached = count == n; lock.unlock()
-            if reached { _exit(code) }
+            if reached { _exit(expected.map { $0 == step } ?? true ? code : Self.otherStep) }
         }
     }
 
     /// Run in an exit test's own process: the switch through update(), or (`recovering`) a start of the saved
-    /// engine, stopped like a crash (_exit: no defers, no catch) at its `n`th step with exit code `code`.
-    static func runInterrupted(root: URL, switchingOn: Bool, recovering: Bool, at n: Int, code: Int32) async throws {
+    /// engine, stopped like a crash (_exit: no defers, no catch) at its `n`th step, `expected`, with exit code `code`.
+    static func runInterrupted(root: URL, switchingOn: Bool, recovering: Bool, at n: Int, expecting expected: String, code: Int32) async throws {
         let service = WineService(paths: PortnautPaths(root: root), metalShim: nil)
-        let stop = StepStop(at: n, code: code)
+        let stop = StepStop(at: n, expecting: expected, code: code)
         service.engineStep = { stop.reach($0) }
         var bottle = try service.bottle(EngineProfileTests().gtaBottle().id)
         if recovering {
@@ -984,40 +991,169 @@ struct EngineProfileTests {
         }
     }
 
-    /// An engine switch stopped like a crash at any of its steps (between an unlink and its copy, around the
-    /// backup's publication and retirement, each record write, the save), and the start that recovers it
-    /// stopped once more at one of its own, ends at the next clean start whole on the saved engine, with every
-    /// original's bytes, absence and link target. A process exit, not a thrown error: defers and catch blocks
-    /// that clean up do not run. Power loss itself is not reproduced; the barriers' order is checked below.
-    @Test(arguments: [true, false], [false, true])
-    func aSwitchCrashedAtAnyStepEndsWholeOnTheSavedEngine(switchingOn: Bool, crashingRecovery: Bool) async throws {
-        let (dryRoot, dryService, _, _) = try await switchScenario(switchingOn: switchingOn)
-        defer { try? FileManager.default.removeItem(at: dryRoot) }
+    /// What a crash test interrupts: a switch onto the profile or off it through update(), or a start that applies
+    /// the profile again over a backup covering other names than the profile copies now (applyFiles' changed-names
+    /// branch: the old backup's originals go back and it is discarded before a new one is taken).
+    enum EngineChange: CaseIterable, Sendable { case switchingOn, switchingOff, changedNames }
+
+    /// A ready bottle set up for `change`, as switchScenario. For changedNames the bottle is on the profile from an
+    /// earlier build, whose list lacked d3d10core.dll: its backup covers the other four names, d3d10core.dll's
+    /// original (the link) is in system32, and its record names an older marker, so the next start applies it again.
+    func changeScenario(_ change: EngineChange) async throws -> (URL, WineService, BottlePaths, URL) {
+        guard change == .changedNames else { return try await switchScenario(switchingOn: change == .switchingOn) }
+        let fm = FileManager.default
+        let (root, service, bottlePaths, program) = try await switchScenario(switchingOn: false)
+        do {
+            let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
+            let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+            var covered = try #require(try service.engineBackupNames(of: .gta5Enhanced, in: bottlePaths))
+            try fm.removeItem(at: system32.appendingPathComponent("d3d10core.dll"))
+            try fm.moveItem(at: backup.appendingPathComponent("d3d10core.dll"), to: system32.appendingPathComponent("d3d10core.dll"))
+            covered.kept.removeAll { $0 == "d3d10core.dll" }
+            #expect(covered.all == ["dxgi.dll", "d3d11.dll", "d3d12.dll", "atidxx64.dll"])
+            try JSONEncoder().encode(covered).write(to: backup.appendingPathComponent(WineService.engineBackupNamesFile))
+            try service.writeEngineState(.applied(.gta5Enhanced, marker: "gta5-enhanced-v2:earlier"), in: bottlePaths)
+        } catch {
+            try? fm.removeItem(at: root)
+            throw error
+        }
+        return (root, service, bottlePaths, program)
+    }
+
+    /// cloneRoot for an engine crash test. Drive Y: is a link holding an absolute path into `root`; it is pointed at
+    /// the same place in the clone, or the clone's start would find drive Y: elsewhere and change the engine where a
+    /// start of `root` would not.
+    func cloneEngineRoot(_ root: URL) throws -> URL {
+        let fm = FileManager.default
+        let copy = try cloneRoot(root)
+        do {
+            let drive = PortnautPaths(root: copy).bottle(gtaBottle()).prefix.appendingPathComponent("dosdevices/y:")
+            if let target = try? fm.destinationOfSymbolicLink(atPath: drive.path), target.hasPrefix(root.path + "/") {
+                try fm.removeItem(at: drive)
+                try fm.createSymbolicLink(atPath: drive.path, withDestinationPath: copy.path + target.dropFirst(root.path.count))
+            }
+        } catch {
+            try? fm.removeItem(at: copy)
+            throw error
+        }
+        return copy
+    }
+
+    /// The program the crash tests start, in the bottle of the root `service` works on.
+    func game(_ service: WineService) -> URL { service.paths.bottle(gtaBottle()).drive.appendingPathComponent("game.exe") }
+
+    /// An engine change stopped like a crash at any of its steps (between an unlink and its copy, around the
+    /// backup's publication and retirement, each record write, the save), and the start that recovers it stopped
+    /// once more at one of its own steps, ends at the next clean start whole on the saved engine, with every
+    /// original's bytes, absence and link target. This test stops each recovery at one step, the one whose name it
+    /// stopped least often so far (the later one on a tie), so the recoveries' steps are spread over the first
+    /// crashes; the matrix below stops each recovery at every one. Power loss itself is not reproduced; the
+    /// barriers' order is checked below.
+    @Test(arguments: EngineChange.allCases)
+    func anEngineChangeCrashedAtAnyStepEndsWholeOnTheSavedEngine(_ change: EngineChange) async throws {
+        try await crashEngineChange(change, stoppingEveryRecoveryStep: false)
+    }
+
+    /// Every (first crash, second crash) pair of crashEngineChange: each recovery stopped at each of its own steps.
+    /// A child process per pair, about seven minutes on an M1 Pro (measured 2026-11-23: 406 s and 442 s for the three cases), so
+    /// it runs only when asked: `PORTNAUT_CRASH_MATRIX=1 bash scripts/test.sh --filter AndItsRecoveryAtAnyOfItsOwn`.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["PORTNAUT_CRASH_MATRIX"] == "1"), arguments: EngineChange.allCases)
+    func anEngineChangeCrashedAtAnyStepAndItsRecoveryAtAnyOfItsOwnEndsWholeOnTheSavedEngine(_ change: EngineChange) async throws {
+        try await crashEngineChange(change, stoppingEveryRecoveryStep: true)
+    }
+
+    /// Stops `change` at each of its steps in a child process (exit 42), as a crash does (_exit: no defers, no catch
+    /// blocks that clean up). The recovery's steps are counted on an APFS clone of what that crash left; each second
+    /// crash (all of them, or one per first crash) runs a child recovery on a clone of its own, stopped at its mth
+    /// step (exit 43, and only at the step counted there: StepStop.otherStep otherwise), then a clean start. The
+    /// crashed root itself recovers in-process, unstopped, through the steps the clone counted.
+    func crashEngineChange(_ change: EngineChange, stoppingEveryRecoveryStep: Bool) async throws {
+        let fm = FileManager.default
+        let (dryRoot, dryService, _, _) = try await changeScenario(change)
+        defer { try? fm.removeItem(at: dryRoot) }
         let recorded = Recorded()
         dryService.engineStep = { if !$0.hasPrefix("sync:") { recorded.append($0) } }
         var dryBottle = try dryService.bottle(gtaBottle().id)
-        dryBottle.engineProfile = switchingOn ? .gta5Enhanced : nil
-        try await dryService.update(dryBottle)
+        let from = dryBottle.engineProfile
+        switch change {
+        case .switchingOn, .switchingOff:
+            dryBottle.engineProfile = change == .switchingOn ? .gta5Enhanced : nil
+            try await dryService.update(dryBottle)
+        case .changedNames:
+            try await dryService.launch(game(dryService), in: dryBottle, waitForSession: false)
+        }
+        let to = dryBottle.engineProfile
         let steps = recorded.values
-        #expect(steps.contains("record:changing") && steps.contains("record:applied") && steps.contains(switchingOn ? "backup:publish" : "backup:discard"))
-        for n in 1...steps.count {
-            let (root, _, bottlePaths, program) = try await switchScenario(switchingOn: switchingOn)
-            defer { try? FileManager.default.removeItem(at: root) }
-            await #expect(processExitsWith: .exitCode(42), "stopped at \(steps[n - 1])") { [root = root as URL, switchingOn, n = n as Int] in
-                try await EngineProfileTests.runInterrupted(root: root, switchingOn: switchingOn, recovering: false, at: n, code: 42)
+        try #require(steps.contains("record:changing") && steps.contains("record:applied"), "\(steps)")
+        switch change {
+        case .switchingOn: #expect(steps.contains("backup:publish"))
+        case .switchingOff: #expect(steps.contains("backup:discard"))
+        case .changedNames:
+            // The old backup's originals go back, then it goes, then the new one is taken.
+            let restored = try #require(steps.lastIndex { $0.hasPrefix("restore:copy:") }, "\(steps)")
+            let discard = try #require(steps.firstIndex(of: "backup:discard"), "\(steps)")
+            let publish = try #require(steps.firstIndex(of: "backup:publish"), "\(steps)")
+            #expect(restored < discard && discard < publish, "\(steps)")
+        }
+        // The `save` step comes before the save: a change stopped after it has the new choice saved.
+        let save = try #require(steps.firstIndex(of: "save"), "\(steps)")
+        // Children run a few at a time, each on its own clone; the cases of a test run side by side.
+        let width = max(1, ProcessInfo.processInfo.activeProcessorCount / EngineChange.allCases.count)
+        var stopped: [String: Int] = [:]
+        for index in steps.indices {
+            let n = index + 1, step = steps[index]
+            let (root, _, bottlePaths, _) = try await changeScenario(change)
+            defer { try? fm.removeItem(at: root) }
+            let first = "\(change): stopped at step \(n), \(step)"
+            let on = change == .switchingOn, start = change == .changedNames
+            try await #require(processExitsWith: .exitCode(42), "\(first)") { [root = root as URL, on = on as Bool, start = start as Bool, n = n as Int, step = step as String] in
+                try await EngineProfileTests.runInterrupted(root: root, switchingOn: on, recovering: start, at: n, expecting: step, code: 42)
             }
-            // The choice saved when the switch stopped; recovery brings the bottle to it and never changes it.
+            // The choice saved when the change stopped; recovery brings the bottle to it and never changes it.
             let chosen = try WineService(paths: PortnautPaths(root: root), metalShim: nil).bottle(gtaBottle().id).engineProfile
-            if crashingRecovery {
-                // Stopped at its own nth step, or done before it (a recovery with fewer steps): both exit 0.
-                await #expect(processExitsWith: .success, "recovery after \(steps[n - 1])") { [root = root as URL, n = n as Int] in
-                    try await EngineProfileTests.runInterrupted(root: root, switchingOn: false, recovering: true, at: n, code: 0)
+            #expect(chosen == (index > save ? to : from), "\(first)")
+            let dry = try cloneEngineRoot(root)
+            defer { try? fm.removeItem(at: dry) }
+            let dryRecovery = WineService(paths: PortnautPaths(root: dry), metalShim: nil)
+            let counted = Recorded()
+            dryRecovery.engineStep = { if !$0.hasPrefix("sync:") { counted.append($0) } }
+            try await dryRecovery.launch(game(dryRecovery), in: try dryRecovery.bottle(gtaBottle().id), waitForSession: false)
+            let recoverySteps = counted.values
+            let stops: [Int]
+            if stoppingEveryRecoveryStep || recoverySteps.isEmpty {
+                stops = recoverySteps.indices.map { $0 + 1 }
+            } else {
+                let least = recoverySteps.indices.reversed().min { stopped[recoverySteps[$0], default: 0] < stopped[recoverySteps[$1], default: 0] }!
+                stopped[recoverySteps[least], default: 0] += 1
+                stops = [least + 1]
+            }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for (started, m) in stops.enumerated() {
+                    if started >= width { try await group.next() }
+                    let copy = try cloneEngineRoot(root)
+                    let second = recoverySteps[m - 1]
+                    let context = "\(first), recovery stopped at step \(m), \(second)"
+                    group.addTask {
+                        defer { try? FileManager.default.removeItem(at: copy) }
+                        try await #require(processExitsWith: .exitCode(43), "\(context)") { [copy = copy as URL, m = m as Int, second = second as String] in
+                            try await EngineProfileTests.runInterrupted(root: copy, switchingOn: false, recovering: true, at: m, expecting: second, code: 43)
+                        }
+                        let fresh = WineService(paths: PortnautPaths(root: copy), metalShim: nil)
+                        try await fresh.launch(game(fresh), in: try fresh.bottle(gtaBottle().id), waitForSession: false)
+                        #expect(try fresh.bottle(gtaBottle().id).engineProfile == chosen, "\(context)")
+                        try await expectRecovered(fresh, fresh.paths.bottle(gtaBottle()), context)
+                    }
                 }
+                try await group.waitForAll()
             }
             let fresh = WineService(paths: PortnautPaths(root: root), metalShim: nil)
-            try await fresh.launch(program, in: try fresh.bottle(gtaBottle().id), waitForSession: false)
-            #expect(try fresh.bottle(gtaBottle().id).engineProfile == chosen, "stopped at \(steps[n - 1])")
-            try await expectRecovered(fresh, bottlePaths, "stopped at \(steps[n - 1])\(crashingRecovery ? ", recovery stopped" : "")")
+            let own = Recorded()
+            fresh.engineStep = { if !$0.hasPrefix("sync:") { own.append($0) } }
+            try await fresh.launch(game(fresh), in: try fresh.bottle(gtaBottle().id), waitForSession: false)
+            fresh.engineStep = nil
+            #expect(own.values == recoverySteps, "\(first): the clone counted the steps the crashed root takes")
+            #expect(try fresh.bottle(gtaBottle().id).engineProfile == chosen, "\(first)")
+            try await expectRecovered(fresh, bottlePaths, first)
         }
     }
 
