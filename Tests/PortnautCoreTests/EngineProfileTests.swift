@@ -953,7 +953,7 @@ struct EngineProfileTests {
         #expect((try? fm.destinationOfSymbolicLink(atPath: link.path)) == "elsewhere.dll", "\(context)")
         if saved != nil { #expect(fm.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path), "\(context)") }
         let left = try fm.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut").path)
-        #expect(left.allSatisfy { !$0.hasPrefix(".engine-backup-") && !$0.contains(WineService.durableTemporaryMark) }, "\(context): \(left)")
+        #expect(left.allSatisfy { !$0.hasPrefix(".engine-backup-") && !$0.contains(Durable.temporaryMark) }, "\(context): \(left)")
     }
 
     /// Ends this process with exit code `code` at the change's `n`th step (barriers are not counted).
@@ -1043,7 +1043,7 @@ struct EngineProfileTests {
         let changing = try index("record:changing")
         let recordWritten = try index("sync:" + portnaut.path, after: changing)
         #expect(try recordWritten < index("drive"))
-        #expect(steps[changing..<recordWritten].contains { $0.hasPrefix("sync:" + portnaut.path + "/.engine-state.json" + WineService.durableTemporaryMark) })
+        #expect(steps[changing..<recordWritten].contains { $0.hasPrefix("sync:" + portnaut.path + "/.engine-state.json" + Durable.temporaryMark) })
         #expect(steps[..<changing].contains("sync:" + bottlePaths.drive.path))
         let applied = try index("record:applied")
         let beforeApplied = Set(steps[..<applied])
@@ -1103,7 +1103,7 @@ struct EngineProfileTests {
         let stage = portnaut.appendingPathComponent(".engine-backup-" + UUID().uuidString)
         try fm.createDirectory(at: stage, withIntermediateDirectories: true)
         try Data("orig".utf8).write(to: stage.appendingPathComponent("d3d11.dll"))
-        try Data("{\"app".utf8).write(to: portnaut.appendingPathComponent(".engine-state.json" + WineService.durableTemporaryMark + UUID().uuidString))
+        try Data("{\"app".utf8).write(to: portnaut.appendingPathComponent(".engine-state.json" + Durable.temporaryMark + UUID().uuidString))
         let discarded = service.engineBackup(of: .gta5Enhanced, in: bottlePaths).deletingLastPathComponent().appendingPathComponent(".discarded-earlier")
         try fm.createDirectory(at: discarded, withIntermediateDirectories: true)
         try await service.launch(program, in: bottle, waitForSession: false)
@@ -1395,6 +1395,203 @@ struct EngineProfileTests {
         try await service.restoreSaves(backup, to: bottle)
         #expect(held.values == ["wineserver -k held free, -k0 held held", "gate held", "session held"])
         #expect(contents(save) == "backed up")
+    }
+
+    /// A restorable bottle (without its prefix, when `prefixExists` is false) whose record gained a game after its
+    /// snapshot, and whose snapshot holds a file the prefix does not: which prefix and which record a restore
+    /// left show apart.
+    func crashableRestore(_ service: WineService, prefixExists: Bool) async throws -> (Bottle, BottlePaths) {
+        let (restorable, bottlePaths, snapshot, _) = try await restorableBottle(service)
+        var bottle = restorable
+        try Data("snapshot".utf8).write(to: service.paths.snapshots(of: bottle).appendingPathComponent(snapshot.id).appendingPathComponent("prefix/only-in-snapshot.txt"))
+        bottle.games.append(Game(id: "after", name: "Added after the snapshot", executable: "after.exe"))
+        try service.save(bottle)
+        if !prefixExists { try FileManager.default.removeItem(at: bottlePaths.prefix) }
+        return (bottle, bottlePaths)
+    }
+
+    /// Run in an exit test's own process: a restore of the bottle's "Earlier" snapshot or (`recovering`) the next
+    /// holder of the bottle's gate (a start's engine check when the bottle has a prefix, else the app's start),
+    /// stopped like a crash at its `n`th step with exit code `code`.
+    static func runInterruptedRestore(root: URL, recovering: Bool, at n: Int, code: Int32) async throws {
+        let service = WineService(paths: PortnautPaths(root: root), metalShim: nil)
+        let stop = StepStop(at: n, code: code)
+        service.engineStep = { stop.reach($0) }
+        let bottle = try service.bottle(EngineProfileTests().gtaBottle().id)
+        if recovering {
+            try await recoverAfterRestore(service, bottle)
+        } else {
+            let snapshot = try #require(service.snapshots(of: bottle).first { $0.label == "Earlier" })
+            try await service.restoreSnapshot(snapshot, of: bottle)
+        }
+    }
+    static func recoverAfterRestore(_ service: WineService, _ bottle: Bottle) async throws {
+        if service.paths.bottle(bottle).ready { try await service.requireEngine(of: bottle).release() } else { try service.recoverRestores() }
+    }
+
+    /// A snapshot restore stopped like a crash at any of its steps (writing the pending record, the swap, saving
+    /// the record, removing the pending record and the replaced prefix, applying the engine), and the gate holder
+    /// that recovers it stopped once more at each of its own steps, ends, once the app's start and a start's
+    /// engine check have recovered it, with the bottle's prefix and record from the same side: the old prefix
+    /// with the old record (or, without a prefix, none) when it stopped before the swap, the snapshot's prefix
+    /// with the restored record after it; no pending record and nothing at the clone's place.
+    @Test(arguments: [true, false], [false, true])
+    func aRestoreCrashedAtAnyStepLeavesThePrefixAndRecordTogether(prefixExists: Bool, crashingRecovery: Bool) async throws {
+        let fm = FileManager.default
+        let (dryRoot, dryService) = try scratchRoot()
+        defer { try? fm.removeItem(at: dryRoot) }
+        let (dryBottle, _) = try await crashableRestore(dryService, prefixExists: prefixExists)
+        let recorded = Recorded()
+        dryService.engineStep = { if !$0.hasPrefix("sync:") { recorded.append($0) } }
+        try await dryService.restoreSnapshot(try #require(dryService.snapshots(of: dryBottle).first { $0.label == "Earlier" }), of: dryBottle)
+        let steps = recorded.values
+        #expect(steps == ["snapshot:pending", "snapshot:swap", "snapshot:save", "snapshot:clear"] + (prefixExists ? ["snapshot:unstage"] : []) + ["snapshot:engine"])
+        // `snapshot:swap` comes before the swap, `snapshot:save` after it.
+        let swapped = try #require(steps.firstIndex(of: "snapshot:save"))
+        for n in 1...steps.count {
+            let (root, service) = try scratchRoot()
+            defer { try? fm.removeItem(at: root) }
+            let (bottle, _) = try await crashableRestore(service, prefixExists: prefixExists)
+            await #expect(processExitsWith: .exitCode(42), "stopped at \(steps[n - 1])") { [root = root as URL, n = n as Int] in
+                try await EngineProfileTests.runInterruptedRestore(root: root, recovering: false, at: n, code: 42)
+            }
+            // Each run of the recovering holder gets a copy of what the crash left, stopped at its own mth step;
+            // the crashed root itself is recovered without a second stop.
+            var ends = [(root, "stopped at \(steps[n - 1])")]
+            var clones: [URL] = []
+            defer { for clone in clones { try? fm.removeItem(at: clone) } }
+            if crashingRecovery {
+                let dry = try cloneRoot(root)
+                clones.append(dry)
+                let drySteps = Recorded()
+                let dryRecovery = WineService(paths: PortnautPaths(root: dry), metalShim: nil)
+                dryRecovery.engineStep = { if !$0.hasPrefix("sync:") { drySteps.append($0) } }
+                try await Self.recoverAfterRestore(dryRecovery, bottle)
+                let recoverySteps = drySteps.values
+                #expect(!recoverySteps.isEmpty, "stopped at \(steps[n - 1]): a recovery with no step to stop at")
+                for m in recoverySteps.indices.map({ $0 + 1 }) {
+                    let copy = try cloneRoot(root)
+                    clones.append(copy)
+                    let context = "stopped at \(steps[n - 1]), recovery stopped at \(recoverySteps[m - 1])"
+                    await #expect(processExitsWith: .exitCode(43), "\(context)") { [copy = copy as URL, m = m as Int] in
+                        try await EngineProfileTests.runInterruptedRestore(root: copy, recovering: true, at: m, code: 43)
+                    }
+                    ends.append((copy, context))
+                }
+            }
+            for (end, context) in ends {
+                let fresh = WineService(paths: PortnautPaths(root: end), metalShim: nil)
+                // The app's start alone recovers it; a start's engine check after it changes neither side.
+                try fresh.recoverRestores()
+                try expectRestoreEnded(fresh, bottle, snapshotSide: n - 1 >= swapped, prefixExists: prefixExists, "\(context), after the app's start")
+                try await Self.recoverAfterRestore(fresh, bottle)
+                try expectRestoreEnded(fresh, bottle, snapshotSide: n - 1 >= swapped, prefixExists: prefixExists, "\(context), after a start")
+            }
+        }
+    }
+
+    /// The bottle's prefix and record are both the snapshot's (`snapshotSide`) or both the old ones, with no pending
+    /// record and nothing at the clone's place.
+    func expectRestoreEnded(_ service: WineService, _ bottle: Bottle, snapshotSide: Bool, prefixExists: Bool, _ context: String) throws {
+        let fm = FileManager.default
+        let record = try service.bottle(bottle.id)
+        let bottlePaths = service.paths.bottle(bottle)
+        if snapshotSide {
+            #expect(contents(bottlePaths.prefix.appendingPathComponent("only-in-snapshot.txt")) == "snapshot", "\(context)")
+            #expect(contents(bottlePaths.drive.appendingPathComponent("after-snapshot.txt")) == nil, "\(context)")
+            #expect(!record.games.contains { $0.id == "after" }, "\(context): the restored record")
+        } else {
+            #expect(fm.fileExists(atPath: bottlePaths.prefix.path) == prefixExists, "\(context)")
+            if prefixExists {
+                #expect(contents(bottlePaths.drive.appendingPathComponent("after-snapshot.txt")) == "kept", "\(context)")
+                #expect(contents(bottlePaths.prefix.appendingPathComponent("only-in-snapshot.txt")) == nil, "\(context)")
+            }
+            #expect(record.games.contains { $0.id == "after" }, "\(context): the old record")
+        }
+        #expect(record.name == bottle.name, "\(context)")
+        #expect((try? fm.attributesOfItem(atPath: bottlePaths.drive.appendingPathComponent(WineService.restorePending).path)) == nil, "\(context)")
+        #expect((try? fm.attributesOfItem(atPath: service.stagedRestore(of: bottle).path)) == nil, "\(context)")
+    }
+
+    /// A recovery of a restore stopped right after its swap makes the swap durable before it saves the record,
+    /// as the stopped restore may not have.
+    @Test func aRecoveryMakesTheSwapDurableBeforeItSavesTheRecord() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, _) = try await crashableRestore(service, prefixExists: true)
+        // The restore's third step, `snapshot:save`, comes once its swap is done.
+        await #expect(processExitsWith: .exitCode(42)) { [root = root as URL] in
+            try await EngineProfileTests.runInterruptedRestore(root: root, recovering: false, at: 3, code: 42)
+        }
+        let recorded = Recorded()
+        service.engineStep = { recorded.append($0) }
+        try service.recoverRestores()
+        let steps = recorded.values
+        let save = try #require(steps.firstIndex(of: "snapshot:save"), "\(steps)")
+        let synced = try #require(steps.firstIndex(of: "sync:" + service.paths.bottles.path), "\(steps)")
+        #expect(synced < save)
+        try expectRestoreEnded(service, bottle, snapshotSide: true, prefixExists: true, "recovered")
+    }
+
+    /// The app's start recovers every bottle it can: one whose pending record cannot be read stops only its own
+    /// recovery, reported once the others are done.
+    @Test func theAppsStartRecoversTheOtherBottlesPastOneItCannot() throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var broken = gtaBottle(), other = gtaBottle()
+        broken.id = "a-broken"; other.id = "b-other"
+        try service.paths.saveLibrary(Library(bottles: [broken, other]))
+        let pending = service.paths.bottle(broken).drive.appendingPathComponent(WineService.restorePending)
+        try FileManager.default.createDirectory(at: pending.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{".utf8).write(to: pending)
+        try FileManager.default.createDirectory(at: service.stagedRestore(of: other), withIntermediateDirectories: true)
+        let failed = #expect(throws: PortnautError.self) { try service.recoverRestores() }
+        #expect(failed?.message.contains(pending.path) == true)
+        #expect((try? FileManager.default.attributesOfItem(atPath: service.stagedRestore(of: other).path)) == nil)
+        #expect(FileManager.default.fileExists(atPath: pending.path))
+    }
+
+    /// A library save removes the temporary file a crashed one left beside library.json.
+    @Test func aLibrarySaveRemovesWhatACrashedOneLeft() throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let left = root.appendingPathComponent(".library.json" + Durable.temporaryMark + UUID().uuidString)
+        try Data("{".utf8).write(to: left)
+        let bottle = gtaBottle()
+        try service.save(bottle)
+        #expect(!FileManager.default.fileExists(atPath: left.path))
+        #expect(try service.bottle(bottle.id) == bottle)
+    }
+
+    /// An APFS clone of a scratch root beside it, for a run that must not change the original.
+    func cloneRoot(_ root: URL) throws -> URL {
+        let copy = root.deletingLastPathComponent().appendingPathComponent("portnaut-engine-" + UUID().uuidString)
+        guard clonefile(root.path, copy.path, 0) == 0 else { throw PortnautError("clonefile: \(String(cString: strerror(errno)))") }
+        return copy
+    }
+
+    /// The pending record and the swap are durable before the record that relies on them is saved, and the
+    /// saved record is durable before the pending one goes. (Power loss is not reproducible; this checks the order.)
+    @Test func aRestoreIsDurableBeforeTheStepsThatRelyOnIt() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, _) = try await crashableRestore(service, prefixExists: true)
+        let recorded = Recorded()
+        service.engineStep = { recorded.append($0) }
+        try await service.restoreSnapshot(try #require(service.snapshots(of: bottle).first { $0.label == "Earlier" }), of: bottle)
+        let steps = recorded.values
+        let staged = service.stagedRestore(of: bottle)
+        let pendingFolder = BottlePaths(prefix: staged).drive.appendingPathComponent(WineService.restorePending).deletingLastPathComponent()
+        func index(_ step: String) throws -> Int { try #require(steps.firstIndex(of: step), "\(step) in \(steps)") }
+        let swap = try index("snapshot:swap"), save = try index("snapshot:save"), clear = try index("snapshot:clear")
+        #expect(steps[..<swap].contains { $0.hasPrefix("sync:" + pendingFolder.path + "/." + URL(fileURLWithPath: WineService.restorePending).lastPathComponent + Durable.temporaryMark) })
+        for folder in [pendingFolder, BottlePaths(prefix: staged).drive, staged] { #expect(try index("sync:" + folder.path) < swap, "\(folder.path)") }
+        #expect(try index("sync:" + service.paths.bottles.path) > swap && index("sync:" + service.paths.bottles.path) < save)
+        // The saved record (library.json's data, then its folder) is durable before the pending record goes.
+        let library = service.paths.library
+        #expect(steps[save..<clear].contains { $0.hasPrefix("sync:" + library.deletingLastPathComponent().path + "/." + library.lastPathComponent + Durable.temporaryMark) })
+        #expect(try index("sync:" + library.deletingLastPathComponent().path) > save && index("sync:" + library.deletingLastPathComponent().path) < clear)
+        #expect(try index("sync:" + service.paths.bottle(bottle).drive.appendingPathComponent("Portnaut").path) > clear)
     }
 
     /// A save backup of a restorable bottle, and its save changed since, which a restore that did not happen

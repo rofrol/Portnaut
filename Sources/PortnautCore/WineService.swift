@@ -17,7 +17,7 @@ public final class WineService: @unchecked Sendable {
     /// Called before each step of an engine change a crash can interrupt, and at each durability barrier
     /// (`sync:` and the path); tests interrupt the change at a step, or check the barriers' order, through it.
     /// A restore calls it as it replaces the bottle's files (`snapshot:swap`, `saves:copy`), where tests check
-    /// the locks it holds.
+    /// the locks it holds, and before each other step a crash can interrupt (`snapshot:` and the step).
     var engineStep: (@Sendable (String) -> Void)?
     public init(paths: PortnautPaths = PortnautPaths(), metalShim: URL? = WineService.bundledMetalShim) {
         self.paths = paths
@@ -101,7 +101,7 @@ public final class WineService: @unchecked Sendable {
 
     public func library() throws -> Library { try paths.loadLibrary() }
     public func save(_ bottle: Bottle) throws {
-        try paths.modifyLibrary { $0.update(bottle) }
+        try paths.modifyLibrary(barrier: { try self.barrier($0) }) { $0.update(bottle) }
     }
     public func bottle(_ id: String) throws -> Bottle {
         guard let bottle = try paths.loadLibrary().bottle(id) else { throw PortnautError("There is no bottle called \(id).") }
@@ -515,6 +515,7 @@ public final class WineService: @unchecked Sendable {
         if let profile = bottle.engineProfile { try await prepareProfile(profile) }
         let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
         defer { gate.release() }
+        try recoverRestore(of: bottle)
         let isNew = !bottlePaths.ready
         if isNew {
             try fm.createDirectory(at: bottlePaths.prefix, withIntermediateDirectories: true)
@@ -934,16 +935,11 @@ public final class WineService: @unchecked Sendable {
         try writeDurably(JSONEncoder().encode(state), to: file)
     }
 
-    /// Makes `url` durable: a file's data, a folder's entries (names added, renamed or removed), or a symbolic
-    /// link itself, never what it points to. F_FULLFSYNC, as plain fsync leaves the data in the drive's cache;
-    /// it works on APFS folders and on links opened with O_SYMLINK (checked on macOS 27.2). An engine change
-    /// orders its steps by these barriers, so one that fails stops the change.
+    /// Durable.barrier, which tests see as a `sync:` step. An engine change and a snapshot restore order their
+    /// steps by these barriers, so one that fails stops the change.
     func barrier(_ url: URL) throws {
         engineStep?("sync:" + url.path)
-        let descriptor = open(url.path, O_RDONLY | O_SYMLINK)
-        guard descriptor >= 0 else { throw PortnautError("Portnaut could not open \(url.path) to save it to disk: \(String(cString: strerror(errno)))") }
-        defer { close(descriptor) }
-        guard fcntl(descriptor, F_FULLFSYNC) == 0 else { throw PortnautError("Portnaut could not save \(url.path) to disk: \(String(cString: strerror(errno)))") }
+        try Durable.barrier(url)
     }
     /// Barriers for every file and folder below `folder`, then `folder` itself.
     func barrier(tree folder: URL) throws {
@@ -956,22 +952,10 @@ public final class WineService: @unchecked Sendable {
         }
         try barrier(folder)
     }
-    /// Writes `data` to `url` whole and durably: a temporary file beside it, synced, renamed over it, then the
-    /// folder synced. (`Data.write(options: .atomic)` keeps its temporary file out of reach of a barrier.)
+    /// Durable.write with this service's barriers, which tests see.
     func writeDurably(_ data: Data, to url: URL) throws {
-        let folder = url.deletingLastPathComponent()
-        let temporary = folder.appendingPathComponent("." + url.lastPathComponent + Self.durableTemporaryMark + UUID().uuidString)
-        do {
-            try data.write(to: temporary)
-            try barrier(temporary)
-            guard rename(temporary.path, url.path) == 0 else { throw PortnautError("Portnaut could not replace \(url.path): \(String(cString: strerror(errno)))") }
-        } catch {
-            try? FileManager.default.removeItem(at: temporary)
-            throw error
-        }
-        try barrier(folder)
+        try Durable.write(data, to: url, barrier: { try self.barrier($0) })
     }
-    static let durableTemporaryMark = ".portnaut-tmp-"
 
     /// Removes what an engine change interrupted by a crash left in the bottle's Portnaut folder: backup stages
     /// (`.engine-backup-*`, never referenced before they are moved into place whole) and writeDurably's
@@ -980,7 +964,7 @@ public final class WineService: @unchecked Sendable {
     func removeEngineLeftovers(in bottlePaths: BottlePaths) throws {
         let folder = bottlePaths.drive.appendingPathComponent("Portnaut")
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
-        for name in names where name.hasPrefix(".engine-backup-") || name.contains(Self.durableTemporaryMark) {
+        for name in names where name.hasPrefix(".engine-backup-") || name.contains(Durable.temporaryMark) {
             try FileManager.default.removeItem(at: folder.appendingPathComponent(name))
         }
     }
@@ -1136,6 +1120,7 @@ public final class WineService: @unchecked Sendable {
         if let profile = bottle.engineProfile, paths.bottle(bottle).ready { try await prepareProfile(profile, progress: progress) }
         let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
         defer { gate.release() }
+        try recoverRestore(of: bottle)
         let old = try? self.bottle(bottle.id).engineProfile
         guard paths.bottle(bottle).ready else { return try save(bottle) }
         // Other settings are saved first; an engine switch only once it has applied (applyEngine).
@@ -1225,6 +1210,7 @@ public final class WineService: @unchecked Sendable {
         guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
         let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
         defer { gate.release() }
+        try recoverRestore(of: bottle)
         let saved = try self.bottle(bottle.id)
         guard bottle.engineProfile == saved.engineProfile else { throw PortnautError("\(bottle.name)’s engine has changed since. Start the program again.") }
         if let profile = saved.engineProfile, !paths.profileReady(profile) {

@@ -121,6 +121,9 @@ final class AppModel: ObservableObject {
     func ready(_ bottle: Bottle) -> Bool { readyBottles.contains(bottle.id) }
 
     init() {
+        // A snapshot restore that stopped part-way (Portnaut or portnaut-doctor quit or crashed) is finished or
+        // undone before the library is shown.
+        do { try service.recoverRestores() } catch { self.error = error.localizedDescription }
         refresh()
         loadCompatibility()
         updateChannel = service.updateChannel

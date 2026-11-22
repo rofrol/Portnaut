@@ -208,17 +208,23 @@ public struct PortnautPaths: Sendable {
         return try body()
     }
     /// Reads the library, changes it and saves it under the library lock: the only way library.json is written.
+    /// `barrier` makes the write durable (a WineService passes its own, which tests see).
     @discardableResult
-    func modifyLibrary<T>(_ change: (inout Library) throws -> T) throws -> T {
+    func modifyLibrary<T>(barrier: (URL) throws -> Void = Durable.barrier, _ change: (inout Library) throws -> T) throws -> T {
         try withLibraryLock {
             var state = try loadLibrary()
             let result = try change(&state)
-            try saveLibrary(state)
+            try saveLibrary(state, barrier: barrier)
+            // A write a crash interrupted left its temporary file; no other writer runs while this holds the lock.
+            let mark = "." + library.lastPathComponent + Durable.temporaryMark
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] where name.hasPrefix(mark) {
+                try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
+            }
             return result
         }
     }
     /// Writes library.json; callers go through modifyLibrary, which holds the lock.
-    func saveLibrary(_ state: Library) throws {
+    func saveLibrary(_ state: Library, barrier: (URL) throws -> Void = Durable.barrier) throws {
         try createDirectories()
         let fm = FileManager.default
         // Keep a 0.1.x file once, before the first save in the new format replaces it.
@@ -228,13 +234,43 @@ public struct PortnautPaths: Sendable {
             try fm.copyItem(at: library, to: backup)
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(state).write(to: library, options: .atomic)
+        // Durable before a caller goes on: a restore removes its pending record only once the bottle's is saved.
+        try Durable.write(encoder.encode(state), to: library, barrier: barrier)
     }
     public static func isContained(_ candidate: URL, by parent: URL) -> Bool {
         let p = parent.resolvingSymlinksInPath().standardizedFileURL.path
         let c = candidate.resolvingSymlinksInPath().standardizedFileURL.path
         return c.hasPrefix(p + "/")
     }
+}
+
+/// Saving to disk past the drive's cache: F_FULLFSYNC barriers, and whole files written through them.
+enum Durable {
+    /// Makes `url` durable: a file's data, a folder's entries (names added, renamed or removed), or a symbolic
+    /// link itself, never what it points to. F_FULLFSYNC, as plain fsync leaves the data in the drive's cache;
+    /// it works on APFS folders and on links opened with O_SYMLINK (checked on macOS 27.2).
+    static func barrier(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_SYMLINK)
+        guard descriptor >= 0 else { throw PortnautError("Portnaut could not open \(url.path) to save it to disk: \(String(cString: strerror(errno)))") }
+        defer { close(descriptor) }
+        guard fcntl(descriptor, F_FULLFSYNC) == 0 else { throw PortnautError("Portnaut could not save \(url.path) to disk: \(String(cString: strerror(errno)))") }
+    }
+    /// Writes `data` to `url` whole and durably: a temporary file beside it, synced, renamed over it, then the
+    /// folder synced. (`Data.write(options: .atomic)` keeps its temporary file out of reach of a barrier.)
+    static func write(_ data: Data, to url: URL, barrier: (URL) throws -> Void = Durable.barrier) throws {
+        let folder = url.deletingLastPathComponent()
+        let temporary = folder.appendingPathComponent("." + url.lastPathComponent + temporaryMark + UUID().uuidString)
+        do {
+            try data.write(to: temporary)
+            try barrier(temporary)
+            guard rename(temporary.path, url.path) == 0 else { throw PortnautError("Portnaut could not replace \(url.path): \(String(cString: strerror(errno)))") }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+        try barrier(folder)
+    }
+    static let temporaryMark = ".portnaut-tmp-"
 }
 
 public struct BottlePaths: Sendable {

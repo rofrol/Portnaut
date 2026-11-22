@@ -109,17 +109,33 @@ extension WineService {
         defer { gate.release() }
         // A restore cancelled while it waited for the gate changes nothing.
         try Task.checkCancellation()
+        try recoverRestore(of: bottle)
         let session = try await stopAndLockIdleSession(of: bottle)
         defer { session.release() }
+        var restored = snapshot.bottle
+        restored.id = bottle.id
+        restored.name = (try? self.bottle(bottle.id).name) ?? bottle.name
+        // Performance records are history, not state: keep the newer ones.
+        let current = (try? self.bottle(bottle.id))?.games ?? []
+        for index in restored.games.indices {
+            if let now = current.first(where: { $0.id == restored.games[index].id }) { restored.games[index].performance = now.performance }
+        }
         // The snapshot is cloned beside the prefix and swapped in at once, so a failure or crash leaves the
-        // current prefix or the restored one in place, never none. Whatever a restore that stopped part-way
-        // left at the clone's place (attributesOfItem does not follow a symlink) is removed first.
+        // current prefix or the restored one in place, never none. The clone carries the record to save as its
+        // pending record: swapped in with the files, it tells recoverRestore that the prefix is the snapshot's
+        // and its record may not be saved yet. Before the swap, a crash leaves only the clone, which recovery removes.
         let prefix = paths.bottle(bottle).prefix
-        let staged = paths.bottles.appendingPathComponent(".\(bottle.id).restoring")
-        if (try? fm.attributesOfItem(atPath: staged.path)) != nil { try fm.removeItem(at: staged) }
+        let staged = stagedRestore(of: bottle)
         let failed = { PortnautError("Portnaut could not restore the snapshot (\(String(cString: strerror(errno)))).") }
         do {
             guard clonefile(source.path, staged.path, 0) == 0 else { throw failed() }
+            let drive = BottlePaths(prefix: staged).drive
+            let pending = drive.appendingPathComponent(Self.restorePending)
+            engineStep?("snapshot:pending")
+            try fm.createDirectory(at: pending.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // The pending record's folders may be new: their entries are made durable with it, before the swap.
+            try writeDurably(Self.json.encoder.encode(restored), to: pending)
+            for folder in [drive, staged] { try barrier(folder) }
             if fm.fileExists(atPath: prefix.path) {
                 try takeSnapshot(of: bottle, label: "Before restoring “\(snapshot.label)”", automatic: true)
                 engineStep?("snapshot:swap")
@@ -133,22 +149,73 @@ extension WineService {
             try? fm.removeItem(at: staged)
             throw error
         }
-        // The replaced prefix, kept in the automatic snapshot. One left here is removed by the next restore; the
-        // restore itself has happened, so its record is still written.
-        try? fm.removeItem(at: staged)
-        var restored = snapshot.bottle
-        restored.id = bottle.id
-        restored.name = (try? self.bottle(bottle.id).name) ?? bottle.name
-        // Performance records are history, not state: keep the newer ones.
-        let current = (try? self.bottle(bottle.id))?.games ?? []
-        for index in restored.games.indices {
-            if let now = current.first(where: { $0.id == restored.games[index].id }) { restored.games[index].performance = now.performance }
-        }
-        try save(restored)
+        // Saves the pending record, removes it, and removes the replaced prefix, kept in the automatic snapshot.
+        try recoverRestore(of: bottle)
         // The snapshot's drive Y: may point at the other engine; its files, registry and engine record are the snapshot's own.
         let engineReady = restored.engineProfile.map { paths.profileReady($0) } ?? paths.runtimeReady
         guard paths.bottle(restored).ready, engineReady else { return }
+        engineStep?("snapshot:engine")
         try await applyEngine(restored, session: session)
+    }
+
+    /// Relative to drive_c: the bottle record a snapshot restore saves once the snapshot's prefix is in place.
+    static let restorePending = "Portnaut/restore-pending.json"
+
+    /// Where a snapshot restore clones the snapshot, beside the prefix; after the swap, the prefix it replaced.
+    func stagedRestore(of bottle: Bottle) -> URL { paths.bottles.appendingPathComponent(".\(bottle.id).restoring") }
+
+    /// Finishes a snapshot restore that stopped after its swap and abandons one that stopped before it. A pending
+    /// record in the prefix (the snapshot's files in place, the bottle record maybe not yet saved) is saved
+    /// durably, then removed; then whatever is at the staged clone's place (a clone not swapped in, or the prefix
+    /// one replaced, kept in the automatic snapshot) is removed. Repeatable, so a crash in it is finished by the
+    /// next call. A lookup that fails other than with "no such file" stops it rather than discard what it could
+    /// not see. Every holder of the bottle's gate calls it first, the restore itself after its swap, and the
+    /// app at start for each bottle whose gate is free (a held gate's holder recovers itself).
+    func recoverRestore(of bottle: Bottle) throws {
+        let fm = FileManager.default
+        let pending = paths.bottle(bottle).drive.appendingPathComponent(Self.restorePending)
+        if try Self.entryExists(pending) {
+            let restored: Bottle
+            do { restored = try Self.json.decoder.decode(Bottle.self, from: Data(contentsOf: pending)) }
+            catch { throw PortnautError("Portnaut cannot read the restore it was finishing (\(pending.path)): \(error.localizedDescription)") }
+            guard restored.id == bottle.id else { throw PortnautError("The restore Portnaut was finishing (\(pending.path)) belongs to another bottle.") }
+            // The swap is durable before the record that relies on it is saved: a restore that stopped right after
+            // its swap may not have synced it.
+            try barrier(paths.bottles)
+            engineStep?("snapshot:save")
+            try save(restored)
+            engineStep?("snapshot:clear")
+            try fm.removeItem(at: pending)
+            try barrier(pending.deletingLastPathComponent())
+        }
+        let staged = stagedRestore(of: bottle)
+        if try Self.entryExists(staged) {
+            engineStep?("snapshot:unstage")
+            try fm.removeItem(at: staged)
+        }
+    }
+
+    /// Whether something (a symbolic link itself included) is at `url`; throws when that cannot be told.
+    static func entryExists(_ url: URL) throws -> Bool {
+        var info = stat()
+        if lstat(url.path, &info) == 0 { return true }
+        guard errno == ENOENT else { throw PortnautError("Portnaut could not look at \(url.path): \(String(cString: strerror(errno)))") }
+        return false
+    }
+
+    /// Finishes or abandons the restores that stopped part-way in bottles no one is changing, at app start.
+    /// A bottle whose gate is held is left to its holder, which recovers it first. One bottle that cannot be
+    /// recovered does not keep the others from it; its error is reported once all were tried.
+    public func recoverRestores() throws {
+        var failures: [String] = []
+        for bottle in try library().bottles {
+            do {
+                guard let gate = try tryLock(.gate, of: bottle, exclusive: true) else { continue }
+                defer { gate.release() }
+                try recoverRestore(of: bottle)
+            } catch { failures.append(error.localizedDescription) }
+        }
+        guard failures.isEmpty else { throw PortnautError(failures.joined(separator: "\n")) }
     }
 
     /// Moves a snapshot to the Trash.
@@ -213,6 +280,7 @@ extension WineService {
         let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
         defer { gate.release() }
         try Task.checkCancellation()
+        try recoverRestore(of: bottle)
         let session = try await stopAndLockIdleSession(of: bottle)
         defer { session.release() }
         try takeSnapshot(of: bottle, label: "Before restoring saves from \(backup.id)", automatic: true)
