@@ -122,8 +122,10 @@ extension WineService {
             guard clonefile(source.path, staged.path, 0) == 0 else { throw failed() }
             if fm.fileExists(atPath: prefix.path) {
                 try takeSnapshot(of: bottle, label: "Before restoring “\(snapshot.label)”", automatic: true)
+                engineStep?("snapshot:swap")
                 guard renamex_np(staged.path, prefix.path, UInt32(RENAME_SWAP)) == 0 else { throw failed() }
             } else {
+                engineStep?("snapshot:swap")
                 guard rename(staged.path, prefix.path) == 0 else { throw failed() }
             }
         } catch {
@@ -215,7 +217,10 @@ extension WineService {
         defer { session.release() }
         try takeSnapshot(of: bottle, label: "Before restoring saves from \(backup.id)", automatic: true)
         let drive = paths.bottle(bottle).drive
-        _ = try await Task.detached { try Self.copyTree(from: source, to: drive, skipping: { _ in false }, overwrite: true) }.value
+        _ = try await Task.detached { [engineStep] in
+            engineStep?("saves:copy")
+            return try Self.copyTree(from: source, to: drive, skipping: { _ in false }, overwrite: true)
+        }.value
     }
 
     /// Copies a folder tree file by file (as clones where the disk allows), skipping folders by name

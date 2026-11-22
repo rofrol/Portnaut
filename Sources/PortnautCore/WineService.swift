@@ -16,6 +16,8 @@ public final class WineService: @unchecked Sendable {
     var lockContended: (@Sendable (BottleLockKind) -> Void)?
     /// Called before each step of an engine change a crash can interrupt, and at each durability barrier
     /// (`sync:` and the path); tests interrupt the change at a step, or check the barriers' order, through it.
+    /// A restore calls it as it replaces the bottle's files (`snapshot:swap`, `saves:copy`), where tests check
+    /// the locks it holds.
     var engineStep: (@Sendable (String) -> Void)?
     public init(paths: PortnautPaths = PortnautPaths(), metalShim: URL? = WineService.bundledMetalShim) {
         self.paths = paths

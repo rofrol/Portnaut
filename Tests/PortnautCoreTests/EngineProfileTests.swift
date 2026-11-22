@@ -188,8 +188,11 @@ struct EngineProfileTests {
     /// `reg import` counts itself in reg-calls and keeps each hive's stamp line in memory (a pending file per
     /// hive: HKEY_CURRENT_USER's for user.reg, HKEY_LOCAL_MACHINE's for system.reg); its `wineserver -w` writes
     /// them to `savedHives`, as Wine's server writes each hive on exit (none: a server killed first). `-k0`
-    /// exits with `probeStatus` (0: a server runs, 1: none).
-    func fakeWine(_ url: URL, exitCode: Int = 0, failing: String? = nil, savedHives: [String] = ["user.reg", "system.reg"], probeStatus: Int = 1) throws {
+    /// exits with `probeStatus` (0: a server runs, 1: none). With `calls`, each run appends a line there: its first
+    /// argument and whether each of `probeLocks` was held then (`held`, `free`, `missing`, or `error` when flock
+    /// failed otherwise).
+    func fakeWine(_ url: URL, exitCode: Int = 0, failing: String? = nil, savedHives: [String] = ["user.reg", "system.reg"], probeStatus: Int = 1,
+                  calls: URL? = nil, probeLocks: [URL] = []) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // wineboot creates the folders prepareBottle's later steps use.
         let wineboot = "[ \"$1\" = wineboot ] && mkdir -p \"$WINEPREFIX/dosdevices\" \"$WINEPREFIX/drive_c/windows/system32\"\n"
@@ -201,7 +204,10 @@ struct EngineProfileTests {
         }
         let registry = "[ \"$1\" = reg ] && { echo reg >> \"$WINEPREFIX/reg-calls\"; \(keep("HKEY_CURRENT_USER", "user.reg")); \(keep("HKEY_LOCAL_MACHINE", "system.reg")); }\n"
             + "[ \"$1\" = -w ] && { for hive in \(savedHives.joined(separator: " ")); do cat \"$WINEPREFIX/in-memory.$hive\" >> \"$WINEPREFIX/$hive\" 2>/dev/null; done; rm -f \"$WINEPREFIX\"/in-memory.*; }\n"
-        try Data("#!/bin/sh\n\(wineboot)\(probe)\(failure)\(registry)exit \(exitCode)\n".utf8).write(to: url)
+        let lockStates = #"perl -MFcntl=:flock -e 'for (@ARGV) { if (open(my $f, "<", $_)) { print flock($f, LOCK_SH | LOCK_NB) ? " free" : $!{EWOULDBLOCK} ? " held" : " error" } else { print " missing" } }'"#
+            + probeLocks.map { " '\($0.path)'" }.joined()
+        let record = calls.map { "{ printf %s \"$1\"; \(lockStates); echo; } >> '\($0.path)'\n" } ?? ""
+        try Data("#!/bin/sh\n\(record)\(wineboot)\(probe)\(failure)\(registry)exit \(exitCode)\n".utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
     func fakeRuntime(_ service: WineService) throws {
@@ -1337,6 +1343,58 @@ struct EngineProfileTests {
         await #expect(throws: CancellationError.self) { try await restore.value }
         #expect(contents(sentinel) == "kept")
         #expect(service.snapshots(of: bottle).count == 1)
+    }
+
+    /// Records, when the restore reaches `step` (as it replaces the bottle's files), the bottle's wineserver runs so
+    /// far (each with the gate's and the session's state then), then whether each of the bottle's locks could
+    /// be taken from a descriptor of its own.
+    func watchRestore(_ service: WineService, of bottle: Bottle, at step: String) throws -> Recorded {
+        let calls = service.paths.root.appendingPathComponent("wineserver-calls")
+        let locks = ["gate", "session"].map { service.paths.bottles.appendingPathComponent(".\(bottle.id).\($0).lock") }
+        try fakeWine(service.paths.wineserver(for: bottle), calls: calls, probeLocks: locks)
+        let held = Recorded()
+        service.engineStep = { [unowned service] reached in
+            guard reached == step else { return }
+            held.append("wineserver " + ((try? String(contentsOf: calls, encoding: .utf8)) ?? "").split(separator: "\n").joined(separator: ", "))
+            for kind in [WineService.BottleLockKind.gate, .session] {
+                do {
+                    let lock = try service.tryLock(kind, of: bottle, exclusive: false)
+                    held.append("\(kind.rawValue) \(lock == nil ? "held" : "free")")
+                    lock?.release()
+                } catch { held.append("\(kind.rawValue) \(error)") }
+            }
+        }
+        return held
+    }
+
+    /// A restore holds the bottle's gate and session while it swaps the snapshot in (or, the prefix gone, moves it in),
+    /// so no managed start can start Wine under it, and asks the bottle's server to stop before it checks, holding
+    /// both, that none runs.
+    @Test(arguments: [true, false]) func aRestoreHoldsTheLocksThroughTheSwapAndStopsBeforeItProbes(prefixExists: Bool) async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, bottlePaths, snapshot, sentinel) = try await restorableBottle(service)
+        if !prefixExists { try FileManager.default.removeItem(at: bottlePaths.prefix) }
+        let restoredFile = bottlePaths.prefix.appendingPathComponent("only-in-snapshot.txt")
+        try Data("snapshot".utf8).write(to: service.paths.snapshots(of: bottle).appendingPathComponent(snapshot.id).appendingPathComponent("prefix/only-in-snapshot.txt"))
+        let held = try watchRestore(service, of: bottle, at: "snapshot:swap")
+        try await service.restoreSnapshot(snapshot, of: bottle)
+        #expect(held.values == ["wineserver -k held free, -k0 held held", "gate held", "session held"])
+        #expect(contents(sentinel) == nil)
+        #expect(contents(restoredFile) == "snapshot")
+        #expect(service.paths.bottle(bottle).ready)
+    }
+
+    /// A save restore holds the bottle's gate and session while it copies the backup's files back, and asks the
+    /// bottle's server to stop before it checks, holding both, that none runs.
+    @Test func aSaveRestoreHoldsTheLocksThroughTheCopyAndStopsBeforeItProbes() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, backup, save) = try await backedUpBottle(service)
+        let held = try watchRestore(service, of: bottle, at: "saves:copy")
+        try await service.restoreSaves(backup, to: bottle)
+        #expect(held.values == ["wineserver -k held free, -k0 held held", "gate held", "session held"])
+        #expect(contents(save) == "backed up")
     }
 
     /// A save backup of a restorable bottle, and its save changed since, which a restore that did not happen
