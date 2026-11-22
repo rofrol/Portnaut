@@ -574,6 +574,98 @@ struct EngineProfileTests {
         #expect(try service.engineState(in: bottlePaths) == .applied(.gta5Enhanced, marker: EngineProfile.gta5Enhanced.marker))
     }
 
+    /// A game's per-program keys outlive the game in the prefix unless Portnaut removes them: imports empty them
+    /// for each program it wrote them for that is no longer a game, until the user hive on disk holds the stamp
+    /// of an import that emptied them (an older one's too; one a killed server never saved does not count);
+    /// then the program is left alone, so keys set up by hand afterwards stay. A program that becomes a game
+    /// again, under another case too, gets its settings back.
+    @Test func aRemovedGamesProgramKeysAreEmptied() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        var game = Game(id: "old", name: "Old", executable: "Games/Old/Old.exe")
+        game.dllOverrides = ["d3d9": .native]
+        bottle.games = [game]
+        try await service.update(bottle)
+        let profile = bottlePaths.drive.appendingPathComponent("Portnaut/profile.reg")
+        let userHive = bottlePaths.prefix.appendingPathComponent("user.reg")
+        let key = "HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\Old.exe"
+        let emptied = "[-\(key)\\DllOverrides]\n[\(key)]\n\"Version\"=-"
+        let empties = { self.contents(profile)?.contains(emptied) == true }
+        let lastStamp = {
+            let text = self.contents(profile) ?? ""
+            return text.range(of: "\"EmptiedStamp\"=\"").map { String(text[$0.upperBound...].prefix { $0 != "\"" }) }
+        }
+        // The server saving the session: the user hive on disk with `stamp`, and a Version for the program set
+        // by hand (winecfg) after its keys were emptied.
+        let save = { (stamp: String?) in
+            let hive = "[Software\\\\Portnaut] 1732238400\n\"EmptiedStamp\"=\"\(stamp ?? "")\"\n\n"
+                + "[Software\\\\Wine\\\\AppDefaults\\\\Old.exe] 1732238400\n\"Version\"=\"win7\"\n"
+            try Data(hive.utf8).write(to: userHive)
+        }
+        #expect(contents(profile)?.contains("[\(key)\\DllOverrides]\n\"d3d9\"=\"native\"") == true)
+        #expect(lastStamp() == nil)
+        try service.removeGame(game, from: bottle)
+        bottle.games = []
+        // Not saved yet: every import empties the keys again, its stamp after them.
+        try await service.requireEngine(of: bottle)
+        #expect(empties())
+        let first = lastStamp()
+        #expect(first != nil && contents(profile)!.range(of: emptied)!.upperBound < contents(profile)!.range(of: "\"EmptiedStamp\"")!.lowerBound)
+        try await service.requireEngine(of: bottle)
+        #expect(empties())
+        #expect(lastStamp() != first)
+        // Saved after the first of them: the next import leaves the program, and the hand-set Version, alone.
+        try save(first)
+        try await service.requireEngine(of: bottle)
+        #expect(!empties())
+        #expect(lastStamp() == nil)
+
+        // Removed again; an import fails and Wine saves nothing of it: the next one empties.
+        bottle.games = [game]
+        try await service.update(bottle)
+        try service.removeGame(game, from: bottle)
+        bottle.games = []
+        let wine = service.paths.wine(for: bottle.renderer)
+        try fakeWine(wine, failing: "reg")
+        await #expect(throws: (any Error).self) { try await service.requireEngine(of: bottle) }
+        try fakeWine(wine)
+        try await service.requireEngine(of: bottle)
+        #expect(empties())
+
+        // Still being emptied, it becomes a game again under another case, the same program to Wine: it gets
+        // its settings and nothing empties them.
+        game.executable = "Games/Old/OLD.EXE"
+        bottle.games = [game]
+        try await service.update(bottle)
+        #expect(contents(profile)?.contains("[HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\OLD.EXE\\DllOverrides]\n\"d3d9\"=\"native\"") == true)
+        #expect(contents(profile)?.contains("[-\(key)\\DllOverrides]") == false)
+        #expect(lastStamp() == nil)
+    }
+
+    /// The emptied stamp is read from Portnaut's own key in the user hive as Wine writes it, whole.
+    @Test func theEmptiedStampIsReadFromTheUserHive() {
+        let hive = """
+        [Software\\\\Portnaut\\\\Other] 1
+        "EmptiedStamp"="other"
+
+        [Software\\\\Portnaut] 1
+        "EngineStamp"="engine"
+        "EmptiedStamp"="saved"
+
+        """
+        #expect(WineService.savedEmptiedStamp(inUserHive: hive) == "saved")
+        #expect(WineService.savedEmptiedStamp(inUserHive: "[Software\\\\Portnaut\\\\Other] 1\n\"EmptiedStamp\"=\"other\"\n") == nil)
+        #expect(WineService.savedEmptiedStamp(inUserHive: "[Software\\\\Portnaut] 1\n\"EmptiedStamp\"=\"saved\n") == nil)
+        #expect(WineService.savedEmptiedStamp(inUserHive: "") == nil)
+    }
+
     /// Waits until the armed Wine reports, through the FIFO at `reached`, that it got to its stop; a `task`
     /// that fails before that writes to the FIFO itself, so the wait ends and the test fails on the task.
     func arrival<T: Sendable>(at reached: String, of task: Task<T, any Error>) async {

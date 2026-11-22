@@ -590,7 +590,8 @@ public final class WineService: @unchecked Sendable {
 
     /// The bottle's Windows version, display resolution mode, and per-program values.
     /// `leaving`: the engine profile the bottle has just left; its values are removed first.
-    public static func profile(for bottle: Bottle, leaving: EngineProfile? = nil) -> String {
+    /// `removedPrograms`: programs that were games once; their per-program keys are emptied.
+    public static func profile(for bottle: Bottle, leaving: EngineProfile? = nil, removedPrograms: [String] = []) -> String {
         let dpi = bottle.retinaMode ? "000000c0" : "00000060"
         return """
         Windows Registry Editor Version 5.00
@@ -608,7 +609,7 @@ public final class WineService: @unchecked Sendable {
         [HKEY_CURRENT_USER\\Software\\Wine\\Fonts]
         "LogPixels"=dword:\(dpi)
 
-        """ + controllerRegistry(bottle.controllers) + componentRegistry(bottle) + gameRegistry(bottle.games)
+        """ + controllerRegistry(bottle.controllers) + componentRegistry(bottle) + gameRegistry(bottle.games, removed: removedPrograms)
             + (bottle.launcher?.registry ?? "")
             // Rockstar's games open the Rockstar Games Launcher from any store (GTA V and Red Dead
             // Redemption 2 bought on Steam or Epic too), so its Social Club window needs its fix everywhere.
@@ -632,9 +633,14 @@ public final class WineService: @unchecked Sendable {
         guard !dlls.isEmpty else { return "" }
         return "[HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides]\n" + dlls.map { "\"\($0)\"=\"native,builtin\"" }.joined(separator: "\n") + "\n\n"
     }
-    /// Per-program settings by file name. Each game's keys are rewritten, so cleared settings go away.
-    static func gameRegistry(_ games: [Game]) -> String {
+    /// Per-program settings by file name. Each game's keys are rewritten, so cleared settings go away; a removed
+    /// program's are emptied the same way, as for a game without settings.
+    static func gameRegistry(_ games: [Game], removed: [String] = []) -> String {
         var lines: [String] = []
+        for program in removed {
+            let key = "HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\\(program)"
+            lines += ["[-\(key)\\DllOverrides]", "[\(key)]", "\"Version\"=-", ""]
+        }
         for game in games {
             let key = "HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\\(game.programName)"
             lines.append("[-\(key)\\DllOverrides]")
@@ -804,9 +810,71 @@ public final class WineService: @unchecked Sendable {
         let stamps = stamp.map { stamp in
             ["HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"].map { "[\($0)\\Software\\Portnaut]\n\"\(Self.engineStampValue)\"=\"\(stamp)\"\n\n" }.joined()
         } ?? ""
-        try Data((Self.profile(for: bottle, leaving: leaving) + stamps).utf8).write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
+        // The programs Portnaut has written per-program keys for, kept beside the profile (every import runs
+        // under the bottle's gate), so a game removed since has its keys emptied. An import that empties keys
+        // sets a stamp new to it after them, as an engine change does, and a removed program leaves the record
+        // once the user hive on disk holds the stamp of an import that emptied it: the server writes a hive
+        // whole, so that import's deletions are on disk too, and keys set up by hand later (winecfg) are left
+        // alone. The record, with this import's stamp, is written before the import: whatever becomes of the
+        // import, no program and no stamp Wine may have saved is missing from it.
+        let record = directory.appendingPathComponent("programs")
+        let previous = FileManager.default.fileExists(atPath: record.path) ? try String(contentsOf: record, encoding: .utf8) : ""
+        // A hive that cannot be read holds no stamp: the programs are emptied again.
+        let userHive = (try? String(contentsOf: paths.bottle(bottle).prefix.appendingPathComponent("user.reg"), encoding: .utf8)) ?? ""
+        var programs = Self.programRecord(previous, games: bottle.games.map(\.programName), savedStamp: Self.savedEmptiedStamp(inUserHive: userHive))
+        let emptiedStamp = UUID().uuidString
+        for index in programs.indices where !programs[index].game { programs[index].emptiedBy.append(emptiedStamp) }
+        try Data(Self.recordText(programs).utf8).write(to: record, options: .atomic)
+        let removed = programs.filter { !$0.game }.map(\.name)
+        let emptying = removed.isEmpty ? "" : "[HKEY_CURRENT_USER\\Software\\Portnaut]\n\"\(Self.emptiedStampValue)\"=\"\(emptiedStamp)\"\n\n"
+        try Data((Self.profile(for: bottle, leaving: leaving, removedPrograms: removed) + emptying + stamps).utf8)
+            .write(to: directory.appendingPathComponent("profile.reg"), options: .atomic)
         try await ProcessRunner.run(paths.wine(for: bottle), ["reg", "import", "C:\\Portnaut\\profile.reg"], environment: environment(for: bottle),
                                     directory: paths.bottle(bottle).drive, log: paths.setupLog, timeout: 30)
+    }
+
+    static let emptiedStampValue = "EmptiedStamp"
+
+    /// A program in Portnaut's record of the programs it wrote per-program keys for: a game of the bottle, or
+    /// a removed one with the stamps of the imports that emptied its keys since.
+    struct RecordedProgram: Equatable { var name: String; var game: Bool; var emptiedBy: [String] }
+
+    /// The record for the next import: `previous` (a name per line; a removed one's followed by a tab and its
+    /// stamps, comma-separated) with the bottle's games added, and without the removed programs that an import
+    /// whose stamp the user hive on disk holds (`savedStamp`) emptied.
+    static func programRecord(_ previous: String, games: [String], savedStamp: String?) -> [RecordedProgram] {
+        // Wine compares key names case-insensitively, without Unicode normalization.
+        let same = { (a: String, b: String) in a.compare(b, options: [.caseInsensitive, .literal]) == .orderedSame }
+        var programs: [RecordedProgram] = []
+        for line in previous.split(separator: "\n") {
+            let fields = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = String(fields[0])
+            guard !name.isEmpty, !programs.contains(where: { same($0.name, name) }) else { continue }
+            let stamps = fields.count > 1 ? fields[1].split(separator: ",").map(String.init) : []
+            programs.append(RecordedProgram(name: name, game: false, emptiedBy: stamps))
+        }
+        for game in games {
+            if let index = programs.firstIndex(where: { same($0.name, game) }) { programs[index] = RecordedProgram(name: game, game: true, emptiedBy: []) }
+            else { programs.append(RecordedProgram(name: game, game: true, emptiedBy: [])) }
+        }
+        return programs.filter { program in program.game || !(savedStamp.map(program.emptiedBy.contains) ?? false) }
+    }
+
+    /// The emptied stamp in the user hive as Wine writes it (`[Software\\Portnaut] <time>` with
+    /// `"EmptiedStamp"="..."` below); nil when it holds none.
+    static func savedEmptiedStamp(inUserHive hive: String) -> String? {
+        var inPortnaut = false
+        for line in hive.split(separator: "\n") {
+            if line.hasPrefix("[") { inPortnaut = line.lowercased().hasPrefix("[software\\\\portnaut]") }
+            else if inPortnaut, line.hasPrefix("\"\(emptiedStampValue)\"=\""), line.count > emptiedStampValue.count + 4, line.hasSuffix("\"") {
+                return String(line.dropFirst(emptiedStampValue.count + 4).dropLast())
+            }
+        }
+        return nil
+    }
+
+    static func recordText(_ programs: [RecordedProgram]) -> String {
+        programs.map { $0.name + ($0.game ? "" : "\t" + $0.emptiedBy.joined(separator: ",")) + "\n" }.joined()
     }
 
     /// The prefix's engine record; nil when the prefix has none (a bottle set up before records existed).
