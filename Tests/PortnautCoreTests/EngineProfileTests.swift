@@ -319,12 +319,85 @@ struct EngineProfileTests {
         try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
         #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:") == true)
         #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
-        #expect(try FileManager.default.contentsOfDirectory(atPath: backup.path).sorted() == ["d3d10core.dll", "d3d11.dll", "dxgi.dll"])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: backup.path).sorted() == [".names.json", "d3d10core.dll", "d3d11.dll", "dxgi.dll"])
         #expect(contents(backup.appendingPathComponent("dxgi.dll")) == "original:dxgi.dll")
         for _ in 0..<2 { try service.restoreFiles(of: .gta5Enhanced, to: bottlePaths) }
         for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
         for name in ["d3d12.dll", "atidxx64.dll"] { #expect(!FileManager.default.fileExists(atPath: system32.appendingPathComponent(name).path)) }
         #expect(try FileManager.default.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut").path).allSatisfy { !$0.hasPrefix(".engine-backup") })
+    }
+
+    /// A bottle that entered when the profile copied other names (no d3d12.dll, an old.dll since dropped) gets
+    /// a backup of today's names at the next apply: old.dll's original is back at once, and leaving puts back
+    /// d3d12.dll's original, which the old backup never held.
+    @Test func aChangedListOfCopiesTakesANewBackup() throws {
+        let fm = FileManager.default
+        let (root, service) = try scratchRoot()
+        defer { try? fm.removeItem(at: root) }
+        let bottlePaths = try readyBottle(gtaBottle(), in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
+        try fm.createDirectory(at: backup, withIntermediateDirectories: true)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { try fm.moveItem(at: system32.appendingPathComponent(name), to: backup.appendingPathComponent(name)) }
+        try Data("original:old.dll".utf8).write(to: backup.appendingPathComponent("old.dll"))
+        try Data(#"{"kept":["dxgi.dll","d3d11.dll","d3d10core.dll","old.dll"],"absent":["atidxx64.dll"]}"#.utf8).write(to: backup.appendingPathComponent(".names.json"))
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll", "old.dll", "atidxx64.dll"] { try Data("profile:old-list".utf8).write(to: system32.appendingPathComponent(name)) }
+        try Data("original:d3d12.dll".utf8).write(to: system32.appendingPathComponent("d3d12.dll"))
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+        #expect(contents(system32.appendingPathComponent("old.dll")) == "original:old.dll")
+        #expect(contents(system32.appendingPathComponent("d3d12.dll"))?.hasPrefix("profile:/") == true)
+        #expect(contents(backup.appendingPathComponent("d3d12.dll")) == "original:d3d12.dll")
+        #expect(!fm.fileExists(atPath: backup.appendingPathComponent("old.dll").path))
+        let names = try JSONDecoder().decode(WineService.EngineBackupNames.self, from: Data(contentsOf: backup.appendingPathComponent(".names.json")))
+        #expect(names == WineService.EngineBackupNames(kept: ["dxgi.dll", "d3d11.dll", "d3d12.dll", "d3d10core.dll"], absent: ["atidxx64.dll"]))
+        try service.restoreFiles(of: .gta5Enhanced, to: bottlePaths)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll", "d3d12.dll", "old.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
+        #expect(!fm.fileExists(atPath: system32.appendingPathComponent("atidxx64.dll").path))
+    }
+
+    /// A backup taken before backups named what they cover (built here by hand, as gta5-enhanced took it then)
+    /// holds the five names it copied then: leaving puts system32 back by them, and applying again names it.
+    @Test(arguments: [false, true])
+    func aBackupWithoutNamesCoversTheNamesCopiedThen(applyingAgain: Bool) throws {
+        let fm = FileManager.default
+        let (root, service) = try scratchRoot()
+        defer { try? fm.removeItem(at: root) }
+        let bottlePaths = try readyBottle(gtaBottle(), in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
+        try fm.createDirectory(at: backup, withIntermediateDirectories: true)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { try fm.moveItem(at: system32.appendingPathComponent(name), to: backup.appendingPathComponent(name)) }
+        for name in ["dxgi.dll", "d3d11.dll", "d3d12.dll", "atidxx64.dll", "d3d10core.dll"] { try Data("profile:then".utf8).write(to: system32.appendingPathComponent(name)) }
+        if applyingAgain {
+            try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+            #expect(fm.fileExists(atPath: backup.appendingPathComponent(".names.json").path))
+        }
+        #expect(try service.engineBackupNames(of: .gta5Enhanced, in: bottlePaths) == WineService.EngineBackupNames(kept: ["dxgi.dll", "d3d11.dll", "d3d10core.dll"], absent: ["d3d12.dll", "atidxx64.dll"]))
+        try service.restoreFiles(of: .gta5Enhanced, to: bottlePaths)
+        for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(contents(system32.appendingPathComponent(name)) == "original:\(name)") }
+        for name in ["d3d12.dll", "atidxx64.dll"] { #expect(!fm.fileExists(atPath: system32.appendingPathComponent(name).path)) }
+    }
+
+    /// Names that contradict the backup's files (a kept original lost, an absent one held) stop leaving and
+    /// applying again, so system32 keeps the profile's copies and the backup stays.
+    @Test(arguments: ["lost", "held"])
+    func aBackupThatContradictsItsNamesIsNotUsed(contradiction: String) throws {
+        let fm = FileManager.default
+        let (root, service) = try scratchRoot()
+        defer { try? fm.removeItem(at: root) }
+        let bottlePaths = try readyBottle(gtaBottle(), in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        let backup = service.engineBackup(of: .gta5Enhanced, in: bottlePaths)
+        try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+        switch contradiction {
+        case "lost": try fm.removeItem(at: backup.appendingPathComponent("d3d11.dll"))
+        default: try Data("stray".utf8).write(to: backup.appendingPathComponent("d3d12.dll"))
+        }
+        #expect(throws: PortnautError.self) { try service.restoreFiles(of: .gta5Enhanced, to: bottlePaths) }
+        #expect(throws: PortnautError.self) { try service.applyFiles(of: .gta5Enhanced, to: bottlePaths) }
+        #expect(contents(system32.appendingPathComponent("d3d11.dll"))?.contains("launcher-wined3d") == true)
+        #expect(contents(system32.appendingPathComponent("dxgi.dll"))?.contains("launcher-wined3d") == true)
+        #expect(contents(backup.appendingPathComponent("dxgi.dll")) == "original:dxgi.dll")
     }
 
     /// Through update(), as the Engine picker and `portnaut-doctor engine` switch: on, a re-save, then off,

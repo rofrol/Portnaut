@@ -896,23 +896,80 @@ public final class WineService: @unchecked Sendable {
         bottlePaths.drive.appendingPathComponent("Portnaut/engine-backup/\(profile.rawValue)")
     }
 
+    /// The system32 names an engine backup covers: `kept` have their original in the backup, `absent` had none.
+    /// Kept in the backup as `.names.json`, written with it, so leaving restores exactly what entering replaced.
+    struct EngineBackupNames: Equatable, Codable {
+        var kept: [String]
+        var absent: [String]
+        var all: Set<String> { Set(kept + absent) }
+    }
+    static let engineBackupNamesFile = ".names.json"
+    /// What gta5-enhanced copied into system32 when backups had no `.names.json`, so what such a backup covers.
+    /// Migration for the gta5-enhanced bottle that entered the profile before; remove it once no bottle's
+    /// backup lacks `.names.json` (applyFiles writes it there).
+    static let namesBeforeBackupNames = ["dxgi.dll", "d3d11.dll", "d3d12.dll", "atidxx64.dll", "d3d10core.dll"]
+
+    /// The names a profile's backup covers; nil when the bottle has no backup of it. Names that contradict the
+    /// backup's files (a kept one missing, an absent one held, so also a name both kept and absent) stop it,
+    /// as restoring by them would delete an original.
+    func engineBackupNames(of profile: EngineProfile, in bottlePaths: BottlePaths) throws -> EngineBackupNames? {
+        let fm = FileManager.default
+        let backup = engineBackup(of: profile, in: bottlePaths)
+        guard fm.fileExists(atPath: backup.path) else { return nil }
+        let file = backup.appendingPathComponent(Self.engineBackupNamesFile)
+        if fm.fileExists(atPath: file.path) {
+            let covered: EngineBackupNames
+            do { covered = try JSONDecoder().decode(EngineBackupNames.self, from: Data(contentsOf: file)) }
+            catch { throw PortnautError("Portnaut cannot read which system32 files the bottle's engine backup holds (\(file.path)): \(error.localizedDescription)") }
+            let held = { (name: String) in Self.present(backup.appendingPathComponent(name)) }
+            if !covered.kept.allSatisfy(held) || covered.absent.contains(where: held) {
+                throw PortnautError("The bottle's engine backup does not match the list of files it holds (\(file.path)); system32 is left as it is.")
+            }
+            return covered
+        }
+        let kept = Self.namesBeforeBackupNames.filter { Self.present(backup.appendingPathComponent($0)) }
+        return EngineBackupNames(kept: kept, absent: Self.namesBeforeBackupNames.filter { !kept.contains($0) })
+    }
+    /// A file or a symbolic link, also one whose target is gone, is at `url`.
+    static func present(_ url: URL) -> Bool {
+        (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil || FileManager.default.fileExists(atPath: url.path)
+    }
+
     /// An engine profile's graphics libraries in system32 and the game's arguments in its commandline.txt.
-    /// The files they replace are kept first (built aside, then moved into place whole); a backup already
-    /// there holds the originals (applyEngine discards one that does not), so it stays.
+    /// The files they replace are kept first (built aside with the names they cover, then moved into place
+    /// whole); a backup already there holds the originals (applyEngine discards one that does not), so it
+    /// stays while it covers the names the profile copies. One that covers other names (the profile's list
+    /// changed since the bottle entered) puts its originals back and is discarded first, so a new one is
+    /// taken: each step can be repeated after a crash, the old backup going only once system32 holds them.
     func applyFiles(of profile: EngineProfile, to bottlePaths: BottlePaths) throws {
         let fm = FileManager.default
         let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
         let backup = engineBackup(of: profile, in: bottlePaths)
+        let names = profile.systemNames(layout: paths.profile(profile))
+        if let covered = try engineBackupNames(of: profile, in: bottlePaths) {
+            let file = backup.appendingPathComponent(Self.engineBackupNamesFile)
+            if covered.all != Set(names) {
+                try restoreFiles(of: profile, to: bottlePaths)
+                try discardBackup(of: profile, in: bottlePaths)
+            } else if !fm.fileExists(atPath: file.path) {
+                try JSONEncoder().encode(covered).write(to: file, options: .atomic)
+            }
+        }
         if !fm.fileExists(atPath: backup.path) {
             let stage = bottlePaths.drive.appendingPathComponent("Portnaut/.engine-backup-" + UUID().uuidString)
             try fm.createDirectory(at: stage, withIntermediateDirectories: true)
             do {
-                for name in profile.systemNames(layout: paths.profile(profile)) {
+                var covered = EngineBackupNames(kept: [], absent: [])
+                for name in names {
                     let original = system32.appendingPathComponent(name)
-                    if (try? fm.destinationOfSymbolicLink(atPath: original.path)) != nil || fm.fileExists(atPath: original.path) {
+                    if Self.present(original) {
                         try fm.copyItem(at: original, to: stage.appendingPathComponent(name))
+                        covered.kept.append(name)
+                    } else {
+                        covered.absent.append(name)
                     }
                 }
+                try JSONEncoder().encode(covered).write(to: stage.appendingPathComponent(Self.engineBackupNamesFile))
                 try fm.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.moveItem(at: stage, to: backup)
             } catch {
@@ -928,19 +985,19 @@ public final class WineService: @unchecked Sendable {
         try writeGameArguments(to: bottlePaths)
     }
 
-    /// Takes an engine profile's files out of system32 and puts back copies of the ones its backup kept;
-    /// applyEngine discards the backup once the switch is recorded. Without a backup the profile's files were
-    /// never copied in (applyFiles keeps the originals first), so system32 is left as it is.
+    /// Puts system32's originals back for every name the profile's backup covers: a copy of each kept one, and
+    /// none where the bottle had none; applyEngine discards the backup once the switch is recorded. Without a
+    /// backup the profile's files were never copied in (applyFiles keeps the originals first), so system32 is
+    /// left as it is.
     func restoreFiles(of profile: EngineProfile, to bottlePaths: BottlePaths) throws {
         let fm = FileManager.default
         let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
         let backup = engineBackup(of: profile, in: bottlePaths)
-        guard fm.fileExists(atPath: backup.path) else { return }
-        for name in profile.systemNames(layout: paths.profile(profile)) {
+        guard let covered = try engineBackupNames(of: profile, in: bottlePaths) else { return }
+        for name in covered.kept + covered.absent {
             let target = system32.appendingPathComponent(name)
-            if (try? fm.destinationOfSymbolicLink(atPath: target.path)) != nil || fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
-            let kept = backup.appendingPathComponent(name)
-            if (try? fm.destinationOfSymbolicLink(atPath: kept.path)) != nil || fm.fileExists(atPath: kept.path) { try fm.copyItem(at: kept, to: target) }
+            if Self.present(target) { try fm.removeItem(at: target) }
+            if covered.kept.contains(name) { try fm.copyItem(at: backup.appendingPathComponent(name), to: target) }
         }
     }
     /// Adds the profile's game arguments to commandline.txt once the game is installed. Runs before every

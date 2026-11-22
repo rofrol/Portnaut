@@ -99,7 +99,8 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
     ]
 
     /// Written into the built profile; a different value rebuilds it. The version names how the profile is
-    /// assembled (engineLinks, layout): change it with them, as the downloads' hashes do not.
+    /// assembled (engineLinks, layout, systemCopies): change it with them, as the downloads' hashes do not;
+    /// a new marker applies the profile again, which takes a new system32 backup when systemCopies' names changed.
     var marker: String { "\(rawValue)-v3:" + downloads.map(\.sha256).joined(separator: "+") }
 
     // MARK: - Layout
