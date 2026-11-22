@@ -739,6 +739,27 @@ struct EngineProfileTests {
         #expect(WineService.savedEmptiedStamp(inUserHive: "") == nil)
     }
 
+    /// Letting go of a bottle lock frees it even while another reference to its open file shares the lock: a
+    /// process another thread spawns holds a copy of every descriptor from its fork until its exec closes the
+    /// close-on-exec ones, and a close alone would leave the lock held until then. A dup stands in for that copy.
+    @Test func aReleasedBottleLockIsFreeWhileASpawningChildSharesIt() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("portnaut-lock-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let descriptor = open(file.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        try #require(descriptor >= 0)
+        let lock = WineService.BottleLock(descriptor: descriptor)
+        try #require(flock(descriptor, LOCK_EX) == 0)
+        let copy = dup(descriptor)
+        try #require(copy >= 0)
+        defer { close(copy) }
+        lock.release()
+        let next = open(file.path, O_RDWR | O_CLOEXEC)
+        try #require(next >= 0)
+        defer { close(next) }
+        let status = flock(next, LOCK_EX | LOCK_NB), error = errno
+        #expect(status == 0, "the lock is still held through the copy (errno \(error))")
+    }
+
     /// Waits until the armed Wine reports, through the FIFO at `reached`, that it got to its stop; a `task`
     /// that fails before that writes to the FIFO itself, so the wait ends and the test fails on the task.
     func arrival<T: Sendable>(at reached: String, of task: Task<T, any Error>) async {

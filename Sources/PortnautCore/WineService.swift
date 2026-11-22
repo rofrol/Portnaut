@@ -730,7 +730,7 @@ public final class WineService: @unchecked Sendable {
     /// change, which does not wait for it: a start whose Wine is not yet up shows in no server probe.
     enum BottleLockKind: String, Sendable { case gate, session }
 
-    /// A held bottle lock; closing its file releases it.
+    /// A held bottle lock; release unlocks it, then closes its file.
     final class BottleLock: @unchecked Sendable {
         private let mutex = NSLock()
         private var descriptor: Int32
@@ -738,7 +738,11 @@ public final class WineService: @unchecked Sendable {
         func release() {
             mutex.lock()
             defer { mutex.unlock() }
-            if descriptor >= 0 { close(descriptor); descriptor = -1 }
+            // A process another thread is spawning holds a copy of this descriptor from its fork until its exec
+            // drops it (O_CLOEXEC acts only then; posix_spawn does the same). flock's lock belongs to the open
+            // file all copies share ("multiple references to a single lock", flock(2) NOTES), so a close alone
+            // would leave it held through that copy; LOCK_UN frees it at once.
+            if descriptor >= 0 { flock(descriptor, LOCK_UN); close(descriptor); descriptor = -1 }
         }
         deinit { release() }
     }
