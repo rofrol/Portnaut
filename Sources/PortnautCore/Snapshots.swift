@@ -107,18 +107,39 @@ extension WineService {
         if let profile = snapshot.bottle.engineProfile { try await prepareProfile(profile, progress: progress) }
         let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
         defer { gate.release() }
+        // A restore cancelled while it waited for the gate changes nothing.
+        try Task.checkCancellation()
+        // Stopping is only asked for (wineserver -k fails when no server runs); what decides is the check that
+        // follows: no managed start between its engine check and its program's end, and no Wine server, else the
+        // restore refuses rather than waiting for programs the user may keep open. Only a bottle without its
+        // engine's wineserver (no runtime prepared) has no server to ask.
         try? await stop(bottle)
-        // The prefix is replaced only once every managed start's program has exited, which stopping the bottle
-        // makes them do; a start that had checked the engine but not yet started its program starts it after
-        // the stop, and the restore waits for that program too.
-        let session = try await waitForLock(.session, of: bottle, exclusive: true)
+        let probing = fm.isExecutableFile(atPath: paths.wineserver(for: bottle).path)
+        let session = try await lockIdleSession(of: bottle, probing: probing)
         defer { session.release() }
+        // The snapshot is cloned beside the prefix and swapped in at once, so a failure or crash leaves the
+        // current prefix or the restored one in place, never none. Whatever a restore that stopped part-way
+        // left at the clone's place (attributesOfItem does not follow a symlink) is removed first.
         let prefix = paths.bottle(bottle).prefix
-        if fm.fileExists(atPath: prefix.path) {
-            try takeSnapshot(of: bottle, label: "Before restoring “\(snapshot.label)”", automatic: true)
-            try fm.removeItem(at: prefix)
+        let staged = paths.bottles.appendingPathComponent(".\(bottle.id).restoring")
+        if (try? fm.attributesOfItem(atPath: staged.path)) != nil { try fm.removeItem(at: staged) }
+        let failed = { PortnautError("Portnaut could not restore the snapshot (\(String(cString: strerror(errno)))).") }
+        do {
+            guard clonefile(source.path, staged.path, 0) == 0 else { throw failed() }
+            if fm.fileExists(atPath: prefix.path) {
+                try takeSnapshot(of: bottle, label: "Before restoring “\(snapshot.label)”", automatic: true)
+                guard renamex_np(staged.path, prefix.path, UInt32(RENAME_SWAP)) == 0 else { throw failed() }
+            } else {
+                guard rename(staged.path, prefix.path) == 0 else { throw failed() }
+            }
+        } catch {
+            // The clone not swapped in; the error to report is the restore's.
+            try? fm.removeItem(at: staged)
+            throw error
         }
-        guard clonefile(source.path, prefix.path, 0) == 0 else { throw PortnautError("Portnaut could not restore the snapshot (\(String(cString: strerror(errno)))).") }
+        // The replaced prefix, kept in the automatic snapshot. One left here is removed by the next restore; the
+        // restore itself has happened, so its record is still written.
+        try? fm.removeItem(at: staged)
         var restored = snapshot.bottle
         restored.id = bottle.id
         restored.name = (try? self.bottle(bottle.id).name) ?? bottle.name

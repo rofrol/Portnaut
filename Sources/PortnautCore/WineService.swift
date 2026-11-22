@@ -673,10 +673,8 @@ public final class WineService: @unchecked Sendable {
         // say applied only once the registry is on disk, which a running server keeps in memory. A managed start
         // holds the session from its engine check until its program has run; a program started outside Portnaut
         // after the server check is not seen, as nothing can lock those out.
-        let busy = PortnautError("Quit the Windows programs running in \(bottle.name) first, then try again.")
-        guard let held = try session ?? tryLock(.session, of: bottle, exclusive: true) else { throw busy }
+        let held = try await lockIdleSession(of: bottle, holding: session)
         defer { if session == nil { held.release() } }
-        if try await serverRunning(for: bottle) { throw busy }
         // The files come from the profile build this Portnaut expects, recorded with its marker; checked before
         // anything changes, though every caller prepared or checked the profile already.
         if let target, !paths.profileReady(target) {
@@ -727,7 +725,8 @@ public final class WineService: @unchecked Sendable {
     /// The gate (exclusive, waited for) is held by whatever reads the bottle's engine to act on it: a managed
     /// start around requireEngine, update, prepareBottle and a snapshot restore. The session is held shared by
     /// a managed start from before it lets the gate go until its program has run, and exclusive by an engine
-    /// change, which does not wait for it: a start whose Wine is not yet up shows in no server probe.
+    /// change or a snapshot restore, which do not wait for it: a start whose Wine is not yet up shows in no
+    /// server probe.
     enum BottleLockKind: String, Sendable { case gate, session }
 
     /// A held bottle lock; release unlocks it, then closes its file.
@@ -765,6 +764,17 @@ public final class WineService: @unchecked Sendable {
         }
         guard error == 0 else { throw PortnautError("Portnaut cannot lock \(bottle.name) (\(String(cString: strerror(error))))." ) }
         return lock
+    }
+
+    /// The bottle's session lock held exclusive (`session` when the caller already holds it, otherwise taken
+    /// here without waiting), once no managed start holds it and, when `probing`, no Wine server runs for the
+    /// prefix; throws otherwise. A program started outside Portnaut after the server check is not seen, as
+    /// nothing can lock those out.
+    func lockIdleSession(of bottle: Bottle, holding session: BottleLock? = nil, probing: Bool = true) async throws -> BottleLock {
+        let busy = PortnautError("Quit the Windows programs running in \(bottle.name) first, then try again.")
+        guard let held = try session ?? tryLock(.session, of: bottle, exclusive: true) else { throw busy }
+        if probing, try await serverRunning(for: bottle) { throw busy }
+        return held
     }
 
     /// Takes one of the bottle's locks if no one else holds it; nil when someone does.

@@ -1040,6 +1040,94 @@ struct EngineProfileTests {
         #expect(service.snapshots(of: plain).count == 1)
     }
 
+    /// A prepared bottle off the profile with a snapshot, and a file written after the snapshot, which a restore
+    /// that did not happen leaves in place.
+    func restorableBottle(_ service: WineService) async throws -> (Bottle, BottlePaths, Snapshot, URL) {
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try await service.update(bottle)
+        let snapshot = try service.takeSnapshot(of: bottle, label: "Earlier")
+        let sentinel = bottlePaths.drive.appendingPathComponent("after-snapshot.txt")
+        try Data("kept".utf8).write(to: sentinel)
+        return (bottle, bottlePaths, snapshot, sentinel)
+    }
+
+    /// A start that has checked the engine but not yet started its program holds the session: a restore refuses
+    /// then, rather than waiting for a program the user may keep open while every other start waits on the gate.
+    @Test func aRestoreRefusesWhileAStartHoldsTheSession() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, _, snapshot, sentinel) = try await restorableBottle(service)
+        let session = try await service.requireEngine(of: bottle)
+        let first = FirstEvent()
+        service.lockContended = { kind in first.signal("contended \(kind.rawValue)") }
+        let restore = Task {
+            defer { first.signal("restore ended") }
+            try await service.restoreSnapshot(snapshot, of: bottle)
+        }
+        #expect(await first.value == "contended session")
+        // A restore that waits for the session goes on once the start lets it go.
+        session.release()
+        let refused = await #expect(throws: PortnautError.self) { try await restore.value }
+        #expect(refused?.message.hasPrefix("Quit the Windows programs") == true)
+        #expect(contents(sentinel) == "kept")
+        #expect(service.snapshots(of: bottle).count == 1)
+    }
+
+    /// A Wine server still running after the stop (a stop that failed, or a launcher's children no managed start
+    /// holds the session for) makes the restore refuse before the prefix changes.
+    @Test func aRestoreRefusesWhileAWineServerRuns() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, _, snapshot, sentinel) = try await restorableBottle(service)
+        try fakeWine(service.paths.wineserver(for: bottle), probeStatus: 0)
+        let refused = await #expect(throws: PortnautError.self) { try await service.restoreSnapshot(snapshot, of: bottle) }
+        #expect(refused?.message.hasPrefix("Quit the Windows programs") == true)
+        #expect(contents(sentinel) == "kept")
+        #expect(service.snapshots(of: bottle).count == 1)
+    }
+
+    /// A snapshot that cannot be cloned leaves the current prefix in place, and no partial clone beside it.
+    @Test func aRestoreThatCannotCloneKeepsThePrefix() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, bottlePaths, snapshot, sentinel) = try await restorableBottle(service)
+        // clonefile needs to read the whole tree: a folder no one may read makes it fail with EACCES.
+        let unreadable = service.paths.snapshots(of: bottle).appendingPathComponent(snapshot.id).appendingPathComponent("prefix/unreadable")
+        try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        #expect(chmod(unreadable.path, 0) == 0)
+        defer { chmod(unreadable.path, 0o755) }
+        await #expect(throws: PortnautError.self) { try await service.restoreSnapshot(snapshot, of: bottle) }
+        #expect(contents(sentinel) == "kept")
+        #expect(bottlePaths.ready)
+        #expect((try? FileManager.default.attributesOfItem(atPath: service.paths.bottles.appendingPathComponent(".\(bottle.id).restoring").path)) == nil)
+    }
+
+    /// A restore cancelled while it waits for the gate changes nothing once it gets the gate.
+    @Test func aRestoreCancelledWhileWaitingForTheGateChangesNothing() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, _, snapshot, sentinel) = try await restorableBottle(service)
+        let gate = try await service.waitForLock(.gate, of: bottle, exclusive: true)
+        let first = FirstEvent()
+        service.lockContended = { kind in first.signal("contended \(kind.rawValue)") }
+        let restore = Task {
+            defer { first.signal("restore ended") }
+            try await service.restoreSnapshot(snapshot, of: bottle)
+        }
+        #expect(await first.value == "contended gate")
+        restore.cancel()
+        gate.release()
+        await #expect(throws: CancellationError.self) { try await restore.value }
+        #expect(contents(sentinel) == "kept")
+        #expect(service.snapshots(of: bottle).count == 1)
+    }
+
     @Test func aProfileBottleHasNoBestSetup() {
         let game = Game(id: "gta5", name: "GTA V Enhanced", executable: EngineProfile.gameFolder + "/GTA5_Enhanced.exe")
         let service = WineService(paths: PortnautPaths(root: URL(fileURLWithPath: "/tmp/portnaut-root")), metalShim: nil)
