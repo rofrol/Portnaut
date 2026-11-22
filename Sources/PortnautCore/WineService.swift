@@ -14,6 +14,9 @@ public final class WineService: @unchecked Sendable {
     /// Called when one of a bottle's locks is held elsewhere, before waiting for it or refusing; tests see the
     /// contention through it.
     var lockContended: (@Sendable (BottleLockKind) -> Void)?
+    /// Called before each step of an engine change a crash can interrupt, and at each durability barrier
+    /// (`sync:` and the path); tests interrupt the change at a step, or check the barriers' order, through it.
+    var engineStep: (@Sendable (String) -> Void)?
     public init(paths: PortnautPaths = PortnautPaths(), metalShim: URL? = WineService.bundledMetalShim) {
         self.paths = paths
         self.metalShim = metalShim
@@ -675,6 +678,7 @@ public final class WineService: @unchecked Sendable {
         // after the server check is not seen, as nothing can lock those out.
         let held = try await lockIdleSession(of: bottle, holding: session)
         defer { if session == nil { held.release() } }
+        try removeEngineLeftovers(in: bottlePaths)
         // The files come from the profile build this Portnaut expects, recorded with its marker; checked before
         // anything changes, though every caller prepared or checked the profile already.
         if let target, !paths.profileReady(target) {
@@ -696,7 +700,10 @@ public final class WineService: @unchecked Sendable {
         let leaving = previous.held.flatMap { $0 == target ? nil : $0 }
         // A backup left by a profile the record says was not applied, nor being applied, holds no originals.
         if let target, previous.held != target { try discardBackup(of: target, in: bottlePaths) }
+        // Durable before the prefix changes: were it lost while later writes survive, a stale record (applied,
+        // holding nothing) would make the next change discard the backup and keep the profile's files as originals.
         try writeEngineState(.changing(holding: leaving ?? target), in: bottlePaths)
+        engineStep?("drive")
         try mapRuntimeDrive(bottlePaths, to: target.map { paths.profile($0).root } ?? paths.runtime)
         if let leaving { try restoreFiles(of: leaving, to: bottlePaths) }
         if let target { try applyFiles(of: target, to: bottlePaths) }
@@ -705,6 +712,7 @@ public final class WineService: @unchecked Sendable {
         // in a hive on disk shows the whole import reached that hive. A server killed before writing also ends
         // the wait, which is why the files are read, not the wait trusted.
         let stamp = UUID().uuidString
+        engineStep?("registry")
         try await importProfile(of: bottle, leaving: leaving, stamp: stamp)
         try await ProcessRunner.run(paths.wineserver(for: bottle), ["-w"], environment: environment(for: bottle), log: paths.setupLog, timeout: nil)
         for hive in ["user.reg", "system.reg"] {
@@ -713,7 +721,15 @@ public final class WineService: @unchecked Sendable {
                 throw PortnautError("Wine did not save \(bottle.name)’s registry (\(hive)). Try again; Portnaut repeats the change at the next start.")
             }
         }
+        // What the record says applied is durable before it says so: drive Y: and both hives (Wine renames
+        // each into place, hence the prefix folder too); applyFiles and restoreFiles synced system32.
+        let drive = bottlePaths.prefix.appendingPathComponent("dosdevices/\(Self.runtimeDrive):")
+        for url in [drive, drive.deletingLastPathComponent()] + ["user.reg", "system.reg"].map(bottlePaths.prefix.appendingPathComponent) + [bottlePaths.prefix] {
+            try barrier(url)
+        }
+        engineStep?("save")
         if saving { try save(bottle) }
+        // Durable (writeEngineState) before the backup of the profile left goes.
         try writeEngineState(.applied(target, marker: marker), in: bottlePaths)
         if let leaving { try discardBackup(of: leaving, in: bottlePaths) }
     }
@@ -910,7 +926,61 @@ public final class WineService: @unchecked Sendable {
     func writeEngineState(_ state: EngineState, in bottlePaths: BottlePaths) throws {
         let file = engineStateFile(in: bottlePaths)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(state).write(to: file, options: .atomic)
+        // Portnaut's folder may be new: its entry in drive C: is made durable with the record.
+        try barrier(bottlePaths.drive)
+        if case .applied = state { engineStep?("record:applied") } else { engineStep?("record:changing") }
+        try writeDurably(JSONEncoder().encode(state), to: file)
+    }
+
+    /// Makes `url` durable: a file's data, a folder's entries (names added, renamed or removed), or a symbolic
+    /// link itself, never what it points to. F_FULLFSYNC, as plain fsync leaves the data in the drive's cache;
+    /// it works on APFS folders and on links opened with O_SYMLINK (checked on macOS 27.2). An engine change
+    /// orders its steps by these barriers, so one that fails stops the change.
+    func barrier(_ url: URL) throws {
+        engineStep?("sync:" + url.path)
+        let descriptor = open(url.path, O_RDONLY | O_SYMLINK)
+        guard descriptor >= 0 else { throw PortnautError("Portnaut could not open \(url.path) to save it to disk: \(String(cString: strerror(errno)))") }
+        defer { close(descriptor) }
+        guard fcntl(descriptor, F_FULLFSYNC) == 0 else { throw PortnautError("Portnaut could not save \(url.path) to disk: \(String(cString: strerror(errno)))") }
+    }
+    /// Barriers for every file and folder below `folder`, then `folder` itself.
+    func barrier(tree folder: URL) throws {
+        for name in try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted() {
+            let item = folder.appendingPathComponent(name)
+            var isFolder: ObjCBool = false
+            let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: item.path)) != nil
+            if !link, FileManager.default.fileExists(atPath: item.path, isDirectory: &isFolder), isFolder.boolValue { try barrier(tree: item) }
+            else { try barrier(item) }
+        }
+        try barrier(folder)
+    }
+    /// Writes `data` to `url` whole and durably: a temporary file beside it, synced, renamed over it, then the
+    /// folder synced. (`Data.write(options: .atomic)` keeps its temporary file out of reach of a barrier.)
+    func writeDurably(_ data: Data, to url: URL) throws {
+        let folder = url.deletingLastPathComponent()
+        let temporary = folder.appendingPathComponent("." + url.lastPathComponent + Self.durableTemporaryMark + UUID().uuidString)
+        do {
+            try data.write(to: temporary)
+            try barrier(temporary)
+            guard rename(temporary.path, url.path) == 0 else { throw PortnautError("Portnaut could not replace \(url.path): \(String(cString: strerror(errno)))") }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+        try barrier(folder)
+    }
+    static let durableTemporaryMark = ".portnaut-tmp-"
+
+    /// Removes what an engine change interrupted by a crash left in the bottle's Portnaut folder: backup stages
+    /// (`.engine-backup-*`, never referenced before they are moved into place whole) and writeDurably's
+    /// temporary files. `.discarded-*` folders stay: one renamed away before the barriers existed may hold the
+    /// last copy of an original. The caller holds the bottle's gate.
+    func removeEngineLeftovers(in bottlePaths: BottlePaths) throws {
+        let folder = bottlePaths.drive.appendingPathComponent("Portnaut")
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
+        for name in names where name.hasPrefix(".engine-backup-") || name.contains(Self.durableTemporaryMark) {
+            try FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
     }
     func engineStateFile(in bottlePaths: BottlePaths) -> URL { bottlePaths.drive.appendingPathComponent("Portnaut/engine-state.json") }
 
@@ -975,7 +1045,7 @@ public final class WineService: @unchecked Sendable {
                 try restoreFiles(of: profile, to: bottlePaths)
                 try discardBackup(of: profile, in: bottlePaths)
             } else if !fm.fileExists(atPath: file.path) {
-                try JSONEncoder().encode(covered).write(to: file, options: .atomic)
+                try writeDurably(JSONEncoder().encode(covered), to: file)
             }
         }
         if !fm.fileExists(atPath: backup.path) {
@@ -993,18 +1063,31 @@ public final class WineService: @unchecked Sendable {
                     }
                 }
                 try JSONEncoder().encode(covered).write(to: stage.appendingPathComponent(Self.engineBackupNamesFile))
+                try barrier(tree: stage)
                 try fm.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
+                engineStep?("backup:publish")
                 try fm.moveItem(at: stage, to: backup)
             } catch {
                 try? fm.removeItem(at: stage)
                 throw error
             }
         }
+        // The backup is durable in place (its folders may be new, hence up to drive C:) before system32 changes;
+        // also when a backup was already there, as the barriers after an earlier publication may have failed.
+        // Its files were synced in the stage.
+        for folder in [backup.deletingLastPathComponent(), backup.deletingLastPathComponent().deletingLastPathComponent(), bottlePaths.drive] {
+            try barrier(folder)
+        }
+        var copied: [URL] = []
         for copy in profile.systemCopies(layout: paths.profile(profile)) {
             let target = system32.appendingPathComponent(copy.name)
+            engineStep?("system32:unlink:" + copy.name)
             if (try? fm.destinationOfSymbolicLink(atPath: target.path)) != nil || fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
+            engineStep?("system32:copy:" + copy.name)
             try fm.copyItem(at: copy.from, to: target)
+            copied.append(target)
         }
+        for url in copied + [system32] { try barrier(url) }
         try writeGameArguments(to: bottlePaths)
     }
 
@@ -1019,9 +1102,13 @@ public final class WineService: @unchecked Sendable {
         guard let covered = try engineBackupNames(of: profile, in: bottlePaths) else { return }
         for name in covered.kept + covered.absent {
             let target = system32.appendingPathComponent(name)
+            engineStep?("restore:unlink:" + name)
             if Self.present(target) { try fm.removeItem(at: target) }
+            engineStep?("restore:copy:" + name)
             if covered.kept.contains(name) { try fm.copyItem(at: backup.appendingPathComponent(name), to: target) }
         }
+        // The originals and system32's entries (removals too) are durable before any backup of them goes.
+        for url in covered.kept.map(system32.appendingPathComponent) + [system32] { try barrier(url) }
     }
     /// Adds the profile's game arguments to commandline.txt once the game is installed. Runs before every
     /// program of a profile bottle, so a game the launcher installs later gets them too. A file that is not
@@ -1060,7 +1147,13 @@ public final class WineService: @unchecked Sendable {
         let fm = FileManager.default
         let backup = engineBackup(of: profile, in: bottlePaths)
         let discarded = backup.deletingLastPathComponent().appendingPathComponent(".discarded-" + UUID().uuidString)
-        if fm.fileExists(atPath: backup.path) { try fm.moveItem(at: backup, to: discarded) }
+        guard fm.fileExists(atPath: backup.path) else { return }
+        engineStep?("backup:discard")
+        try fm.moveItem(at: backup, to: discarded)
+        // The rename is durable before the files go, so power loss cannot leave a half-emptied backup under
+        // its own name, which a replay would take as the originals (and refuse, as its files no longer match).
+        try barrier(backup.deletingLastPathComponent())
+        engineStep?("backup:remove")
         try? fm.removeItem(at: discarded)
     }
 

@@ -894,6 +894,217 @@ struct EngineProfileTests {
         try expectOnEngine(from, service, bottlePaths)
     }
 
+    /// A ready bottle to switch on (off Portnaut's engine onto the profile) or off (already on the profile).
+    /// Its d3d10core.dll original is a symbolic link to elsewhere.dll, which the profile does not touch; its
+    /// d3d12.dll and atidxx64.dll originals are absent. Returns the root, the bottle's paths and a program.
+    func switchScenario(switchingOn: Bool) async throws -> (URL, WineService, BottlePaths, URL) {
+        let fm = FileManager.default
+        let (root, service) = try scratchRoot()
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try fm.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        try fm.removeItem(at: system32.appendingPathComponent("d3d10core.dll"))
+        try Data("original:d3d10core.dll".utf8).write(to: system32.appendingPathComponent("elsewhere.dll"))
+        try fm.createSymbolicLink(atPath: system32.appendingPathComponent("d3d10core.dll").path, withDestinationPath: "elsewhere.dll")
+        let program = bottlePaths.drive.appendingPathComponent("game.exe")
+        try Data().write(to: program)
+        if !switchingOn {
+            bottle.engineProfile = .gta5Enhanced
+            try await service.update(bottle)
+        }
+        return (root, service, bottlePaths, program)
+    }
+
+    /// The bottle is whole on the engine its saved choice names: expectOnEngine, the record, the symbolic link
+    /// original kept as a link (in system32 off the profile, in the backup on it), and no leftovers of a change.
+    /// Off the profile, a backup may remain (a leave stopped after its record said applied); it holds no
+    /// originals, so entering and leaving again must give the same originals back.
+    func expectRecovered(_ service: WineService, _ bottlePaths: BottlePaths, _ context: String) async throws {
+        try expectWhole(service, bottlePaths, context)
+        var bottle = try service.bottle(gtaBottle().id)
+        guard bottle.engineProfile == nil else { return }
+        bottle.engineProfile = .gta5Enhanced
+        try await service.update(bottle)
+        try expectWhole(service, bottlePaths, context + ", entered again")
+        bottle.engineProfile = nil
+        try await service.update(bottle)
+        try expectWhole(service, bottlePaths, context + ", left again")
+        #expect(!FileManager.default.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path), "\(context)")
+    }
+    func expectWhole(_ service: WineService, _ bottlePaths: BottlePaths, _ context: String) throws {
+        let fm = FileManager.default
+        let saved = try service.bottle(gtaBottle().id).engineProfile
+        try expectOnEngine(saved, service, bottlePaths)
+        #expect(try service.engineState(in: bottlePaths) == .applied(saved, marker: saved?.marker), "\(context)")
+        let link = saved == nil
+            ? bottlePaths.drive.appendingPathComponent("windows/system32/d3d10core.dll")
+            : service.engineBackup(of: .gta5Enhanced, in: bottlePaths).appendingPathComponent("d3d10core.dll")
+        #expect((try? fm.destinationOfSymbolicLink(atPath: link.path)) == "elsewhere.dll", "\(context)")
+        if saved != nil { #expect(fm.fileExists(atPath: service.engineBackup(of: .gta5Enhanced, in: bottlePaths).path), "\(context)") }
+        let left = try fm.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("Portnaut").path)
+        #expect(left.allSatisfy { !$0.hasPrefix(".engine-backup-") && !$0.contains(WineService.durableTemporaryMark) }, "\(context): \(left)")
+    }
+
+    /// Ends this process with exit code `code` at the change's `n`th step (barriers are not counted).
+    final class StepStop: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        let n: Int, code: Int32
+        init(at n: Int, code: Int32) { self.n = n; self.code = code }
+        func reach(_ step: String) {
+            guard !step.hasPrefix("sync:") else { return }
+            lock.lock(); count += 1; let reached = count == n; lock.unlock()
+            if reached { _exit(code) }
+        }
+    }
+
+    /// Run in an exit test's own process: the switch through update(), or (`recovering`) a start of the saved
+    /// engine, stopped like a crash (_exit: no defers, no catch) at its `n`th step with exit code `code`.
+    static func runInterrupted(root: URL, switchingOn: Bool, recovering: Bool, at n: Int, code: Int32) async throws {
+        let service = WineService(paths: PortnautPaths(root: root), metalShim: nil)
+        let stop = StepStop(at: n, code: code)
+        service.engineStep = { stop.reach($0) }
+        var bottle = try service.bottle(EngineProfileTests().gtaBottle().id)
+        if recovering {
+            try await service.launch(service.paths.bottle(bottle).drive.appendingPathComponent("game.exe"), in: bottle, waitForSession: false)
+        } else {
+            bottle.engineProfile = switchingOn ? .gta5Enhanced : nil
+            try await service.update(bottle)
+        }
+    }
+
+    /// An engine switch stopped like a crash at any of its steps (between an unlink and its copy, around the
+    /// backup's publication and retirement, each record write, the save), and the start that recovers it
+    /// stopped once more at one of its own, ends at the next clean start whole on the saved engine, with every
+    /// original's bytes, absence and link target. A process exit, not a thrown error: defers and catch blocks
+    /// that clean up do not run. Power loss itself is not reproduced; the barriers' order is checked below.
+    @Test(arguments: [true, false], [false, true])
+    func aSwitchCrashedAtAnyStepEndsWholeOnTheSavedEngine(switchingOn: Bool, crashingRecovery: Bool) async throws {
+        let (dryRoot, dryService, _, _) = try await switchScenario(switchingOn: switchingOn)
+        defer { try? FileManager.default.removeItem(at: dryRoot) }
+        let recorded = Recorded()
+        dryService.engineStep = { if !$0.hasPrefix("sync:") { recorded.append($0) } }
+        var dryBottle = try dryService.bottle(gtaBottle().id)
+        dryBottle.engineProfile = switchingOn ? .gta5Enhanced : nil
+        try await dryService.update(dryBottle)
+        let steps = recorded.values
+        #expect(steps.contains("record:changing") && steps.contains("record:applied") && steps.contains(switchingOn ? "backup:publish" : "backup:discard"))
+        for n in 1...steps.count {
+            let (root, _, bottlePaths, program) = try await switchScenario(switchingOn: switchingOn)
+            defer { try? FileManager.default.removeItem(at: root) }
+            await #expect(processExitsWith: .exitCode(42), "stopped at \(steps[n - 1])") { [root = root as URL, switchingOn, n = n as Int] in
+                try await EngineProfileTests.runInterrupted(root: root, switchingOn: switchingOn, recovering: false, at: n, code: 42)
+            }
+            // The choice saved when the switch stopped; recovery brings the bottle to it and never changes it.
+            let chosen = try WineService(paths: PortnautPaths(root: root), metalShim: nil).bottle(gtaBottle().id).engineProfile
+            if crashingRecovery {
+                // Stopped at its own nth step, or done before it (a recovery with fewer steps): both exit 0.
+                await #expect(processExitsWith: .success, "recovery after \(steps[n - 1])") { [root = root as URL, n = n as Int] in
+                    try await EngineProfileTests.runInterrupted(root: root, switchingOn: false, recovering: true, at: n, code: 0)
+                }
+            }
+            let fresh = WineService(paths: PortnautPaths(root: root), metalShim: nil)
+            try await fresh.launch(program, in: try fresh.bottle(gtaBottle().id), waitForSession: false)
+            #expect(try fresh.bottle(gtaBottle().id).engineProfile == chosen, "stopped at \(steps[n - 1])")
+            try await expectRecovered(fresh, bottlePaths, "stopped at \(steps[n - 1])\(crashingRecovery ? ", recovery stopped" : "")")
+        }
+    }
+
+    /// Each step an engine change relies on is durable before it: the `changing` record before the prefix
+    /// changes, a new backup in place before system32 changes, the originals before their backup goes, and
+    /// drive Y:, system32 and both hives before the record says applied, which is durable before the backup
+    /// of the profile left goes. (Power loss is not reproducible in a test; this checks the barriers' order.)
+    @Test(arguments: [true, false])
+    func anEngineChangeIsDurableBeforeTheStepsThatRelyOnIt(switchingOn: Bool) async throws {
+        let (root, service, bottlePaths, _) = try await switchScenario(switchingOn: switchingOn)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorded = Recorded()
+        service.engineStep = { recorded.append($0) }
+        var bottle = try service.bottle(gtaBottle().id)
+        bottle.engineProfile = switchingOn ? .gta5Enhanced : nil
+        try await service.update(bottle)
+        let steps = recorded.values
+        let portnaut = bottlePaths.drive.appendingPathComponent("Portnaut")
+        let system32 = bottlePaths.drive.appendingPathComponent("windows/system32")
+        func index(_ step: String, after start: Int = -1) throws -> Int {
+            try #require(steps.indices.first { $0 > start && steps[$0] == step }, "\(step) after \(start): \(steps)")
+        }
+        let changing = try index("record:changing")
+        let recordWritten = try index("sync:" + portnaut.path, after: changing)
+        #expect(try recordWritten < index("drive"))
+        #expect(steps[changing..<recordWritten].contains { $0.hasPrefix("sync:" + portnaut.path + "/.engine-state.json" + WineService.durableTemporaryMark) })
+        #expect(steps[..<changing].contains("sync:" + bottlePaths.drive.path))
+        let applied = try index("record:applied")
+        let beforeApplied = Set(steps[..<applied])
+        for url in [system32, bottlePaths.prefix.appendingPathComponent("dosdevices/y:"), bottlePaths.prefix.appendingPathComponent("dosdevices"),
+                    bottlePaths.prefix.appendingPathComponent("user.reg"), bottlePaths.prefix.appendingPathComponent("system.reg"), bottlePaths.prefix] {
+            #expect(beforeApplied.contains("sync:" + url.path), "\(url.path)")
+        }
+        if switchingOn {
+            let publish = try index("backup:publish")
+            let firstUnlink = try #require(steps.firstIndex { $0.hasPrefix("system32:unlink:") })
+            #expect(try index("sync:" + service.engineBackup(of: .gta5Enhanced, in: bottlePaths).deletingLastPathComponent().path, after: publish) < firstUnlink)
+            let staged = steps[..<publish].filter { $0.hasPrefix("sync:" + portnaut.path + "/.engine-backup-") }
+            #expect(staged.contains { $0.hasSuffix("/" + WineService.engineBackupNamesFile) })
+            for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] { #expect(staged.contains { $0.hasSuffix("/" + name) }, "\(name)") }
+            #expect(staged.contains { !$0.dropFirst("sync:".count + portnaut.path.count + 1).contains("/") }, "the stage folder itself")
+            for folder in [service.engineBackup(of: .gta5Enhanced, in: bottlePaths).deletingLastPathComponent(), portnaut, bottlePaths.drive] {
+                #expect(try index("sync:" + folder.path, after: publish) < firstUnlink, "\(folder.path)")
+            }
+            // A replay over a backup already in place makes it durable again before system32 changes.
+            let replay = Recorded()
+            service.engineStep = { replay.append($0) }
+            try service.applyFiles(of: .gta5Enhanced, to: bottlePaths)
+            let replayed = replay.values
+            #expect(!replayed.contains("backup:publish"))
+            let replayUnlink = try #require(replayed.firstIndex { $0.hasPrefix("system32:unlink:") })
+            for folder in [service.engineBackup(of: .gta5Enhanced, in: bottlePaths).deletingLastPathComponent(), portnaut, bottlePaths.drive] {
+                #expect(replayed[..<replayUnlink].contains("sync:" + folder.path), "\(folder.path)")
+            }
+            for copy in EngineProfile.gta5Enhanced.systemCopies(layout: service.paths.profile(.gta5Enhanced)) {
+                #expect(beforeApplied.contains("sync:" + system32.appendingPathComponent(copy.name).path), "\(copy.name)")
+            }
+        } else {
+            let discard = try index("backup:discard")
+            #expect(try index("sync:" + portnaut.path, after: applied) < discard)
+            #expect(steps[..<discard].contains("sync:" + system32.path))
+            let backups = service.engineBackup(of: .gta5Enhanced, in: bottlePaths).deletingLastPathComponent()
+            #expect(try index("sync:" + backups.path, after: discard) < (try index("backup:remove")))
+            for name in ["dxgi.dll", "d3d11.dll", "d3d10core.dll"] {
+                #expect(steps[..<discard].contains("sync:" + system32.appendingPathComponent(name).path), "\(name)")
+            }
+        }
+    }
+
+    /// What a crash leaves does not stay: a start after a leave stopped mid-restore (a truncated original in
+    /// system32), with a backup stage holding a truncated copy and writeDurably's temporary file beside the
+    /// record, restores the originals whole and removes the stage and the file; a `.discarded-*` folder stays.
+    @Test func aStartAfterACrashRemovesWhatTheCrashLeft() async throws {
+        let fm = FileManager.default
+        let (root, service, bottlePaths, program) = try await switchScenario(switchingOn: false)
+        defer { try? fm.removeItem(at: root) }
+        var bottle = try service.bottle(gtaBottle().id)
+        bottle.engineProfile = nil
+        try service.save(bottle)
+        try service.writeEngineState(.changing(holding: .gta5Enhanced), in: bottlePaths)
+        try Data("origin".utf8).write(to: bottlePaths.drive.appendingPathComponent("windows/system32/dxgi.dll"))
+        let portnaut = bottlePaths.drive.appendingPathComponent("Portnaut")
+        let stage = portnaut.appendingPathComponent(".engine-backup-" + UUID().uuidString)
+        try fm.createDirectory(at: stage, withIntermediateDirectories: true)
+        try Data("orig".utf8).write(to: stage.appendingPathComponent("d3d11.dll"))
+        try Data("{\"app".utf8).write(to: portnaut.appendingPathComponent(".engine-state.json" + WineService.durableTemporaryMark + UUID().uuidString))
+        let discarded = service.engineBackup(of: .gta5Enhanced, in: bottlePaths).deletingLastPathComponent().appendingPathComponent(".discarded-earlier")
+        try fm.createDirectory(at: discarded, withIntermediateDirectories: true)
+        try await service.launch(program, in: bottle, waitForSession: false)
+        try await expectRecovered(service, bottlePaths, "after a crash mid-restore")
+        #expect(fm.fileExists(atPath: discarded.path))
+    }
+
     /// A bottle set up on the profile before engine records existed (its backup there, no record) is switched
     /// off through update() before any start: the profile's files and values still go.
     @Test func aBottleFromBeforeRecordsLeavesTheProfile() async throws {
