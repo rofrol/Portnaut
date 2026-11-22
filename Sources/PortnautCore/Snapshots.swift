@@ -109,13 +109,7 @@ extension WineService {
         defer { gate.release() }
         // A restore cancelled while it waited for the gate changes nothing.
         try Task.checkCancellation()
-        // Stopping is only asked for (wineserver -k fails when no server runs); what decides is the check that
-        // follows: no managed start between its engine check and its program's end, and no Wine server, else the
-        // restore refuses rather than waiting for programs the user may keep open. Only a bottle without its
-        // engine's wineserver (no runtime prepared) has no server to ask.
-        try? await stop(bottle)
-        let probing = fm.isExecutableFile(atPath: paths.wineserver(for: bottle).path)
-        let session = try await lockIdleSession(of: bottle, probing: probing)
+        let session = try await stopAndLockIdleSession(of: bottle)
         defer { session.release() }
         // The snapshot is cloned beside the prefix and swapped in at once, so a failure or crash leaves the
         // current prefix or the restored one in place, never none. Whatever a restore that stopped part-way
@@ -212,7 +206,13 @@ extension WineService {
     public func restoreSaves(_ backup: SaveBackup, to bottle: Bottle) async throws {
         let source = paths.saveBackups.appendingPathComponent(bottle.id).appendingPathComponent(backup.id).appendingPathComponent("drive_c")
         guard FileManager.default.fileExists(atPath: source.path) else { throw PortnautError("That backup is no longer in Portnaut Backups.") }
-        try? await stop(bottle)
+        // As for a snapshot restore: the files are copied only while no managed start is under way and no Wine
+        // server runs for the prefix, else the restore refuses.
+        let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
+        defer { gate.release() }
+        try Task.checkCancellation()
+        let session = try await stopAndLockIdleSession(of: bottle)
+        defer { session.release() }
         try takeSnapshot(of: bottle, label: "Before restoring saves from \(backup.id)", automatic: true)
         let drive = paths.bottle(bottle).drive
         _ = try await Task.detached { try Self.copyTree(from: source, to: drive, skipping: { _ in false }, overwrite: true) }.value

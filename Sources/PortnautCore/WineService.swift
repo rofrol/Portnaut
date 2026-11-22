@@ -723,9 +723,9 @@ public final class WineService: @unchecked Sendable {
     /// A bottle's two locks, flock on files beside its prefix (a snapshot restore replaces the prefix), which
     /// every Portnaut process on this root takes; always the gate first, then the session, then the library.
     /// The gate (exclusive, waited for) is held by whatever reads the bottle's engine to act on it: a managed
-    /// start around requireEngine, update, prepareBottle and a snapshot restore. The session is held shared by
-    /// a managed start from before it lets the gate go until its program has run, and exclusive by an engine
-    /// change or a snapshot restore, which do not wait for it: a start whose Wine is not yet up shows in no
+    /// start around requireEngine, update, prepareBottle and a snapshot or save restore. The session is held
+    /// shared by a managed start from before it lets the gate go until its program has run, and exclusive by an
+    /// engine change or a restore, which do not wait for it: a start whose Wine is not yet up shows in no
     /// server probe.
     enum BottleLockKind: String, Sendable { case gate, session }
 
@@ -775,6 +775,15 @@ public final class WineService: @unchecked Sendable {
         guard let held = try session ?? tryLock(.session, of: bottle, exclusive: true) else { throw busy }
         if probing, try await serverRunning(for: bottle) { throw busy }
         return held
+    }
+
+    /// Stops the bottle, then takes its session as lockIdleSession does, for a restore that replaces its files; the
+    /// caller holds the gate. Stopping is only asked for (wineserver -k fails when no server runs); what decides
+    /// is the check after it, so the restore refuses rather than waiting for programs the user may keep open.
+    /// Only a bottle without its engine's wineserver (no runtime prepared) has no server to ask.
+    func stopAndLockIdleSession(of bottle: Bottle) async throws -> BottleLock {
+        try? await stop(bottle)
+        return try await lockIdleSession(of: bottle, probing: FileManager.default.isExecutableFile(atPath: paths.wineserver(for: bottle).path))
     }
 
     /// Takes one of the bottle's locks if no one else holds it; nil when someone does.

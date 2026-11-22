@@ -1128,6 +1128,77 @@ struct EngineProfileTests {
         #expect(service.snapshots(of: bottle).count == 1)
     }
 
+    /// A save backup of a restorable bottle, and its save changed since, which a restore that did not happen
+    /// leaves changed.
+    func backedUpBottle(_ service: WineService) async throws -> (Bottle, SaveBackup, URL) {
+        let (bottle, bottlePaths, _, _) = try await restorableBottle(service)
+        let save = bottlePaths.drive.appendingPathComponent("users/player/Saved Games/Game/slot1.sav")
+        try FileManager.default.createDirectory(at: save.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("backed up".utf8).write(to: save)
+        let backup = try await service.backUpSaves(of: bottle)
+        try Data("changed".utf8).write(to: save)
+        return (bottle, backup, save)
+    }
+
+    /// A save restore refuses while a managed start holds the session, instead of copying over files its program
+    /// is about to use.
+    @Test func aSaveRestoreRefusesWhileAStartHoldsTheSession() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, backup, save) = try await backedUpBottle(service)
+        let session = try await service.requireEngine(of: bottle)
+        defer { session.release() }
+        let refused = await #expect(throws: PortnautError.self) { try await service.restoreSaves(backup, to: bottle) }
+        #expect(refused?.message.hasPrefix("Quit the Windows programs") == true)
+        #expect(contents(save) == "changed")
+        #expect(service.snapshots(of: bottle).count == 1)
+    }
+
+    /// A Wine server still running after the stop makes a save restore refuse before any file is copied.
+    @Test func aSaveRestoreRefusesWhileAWineServerRuns() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, backup, save) = try await backedUpBottle(service)
+        try fakeWine(service.paths.wineserver(for: bottle), probeStatus: 0)
+        let refused = await #expect(throws: PortnautError.self) { try await service.restoreSaves(backup, to: bottle) }
+        #expect(refused?.message.hasPrefix("Quit the Windows programs") == true)
+        #expect(contents(save) == "changed")
+        #expect(service.snapshots(of: bottle).count == 1)
+    }
+
+    /// A save restore cancelled while it waits for the gate copies nothing once it gets the gate.
+    @Test func aSaveRestoreCancelledWhileWaitingForTheGateChangesNothing() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, backup, save) = try await backedUpBottle(service)
+        let gate = try await service.waitForLock(.gate, of: bottle, exclusive: true)
+        let first = FirstEvent()
+        service.lockContended = { kind in first.signal("contended \(kind.rawValue)") }
+        let restore = Task {
+            defer { first.signal("restore ended") }
+            try await service.restoreSaves(backup, to: bottle)
+        }
+        #expect(await first.value == "contended gate")
+        restore.cancel()
+        gate.release()
+        await #expect(throws: CancellationError.self) { try await restore.value }
+        #expect(contents(save) == "changed")
+        #expect(service.snapshots(of: bottle).count == 1)
+    }
+
+    /// A save restore of an idle bottle (its server probed: none runs) keeps the current saves in an automatic
+    /// snapshot, then copies the backup's files back.
+    @Test func aSaveRestoreOfAnIdleBottleCopiesTheBackup() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (bottle, backup, save) = try await backedUpBottle(service)
+        try await service.restoreSaves(backup, to: bottle)
+        #expect(contents(save) == "backed up")
+        let automatic = try #require(service.snapshots(of: bottle).first { $0.automatic })
+        let kept = service.paths.snapshots(of: bottle).appendingPathComponent(automatic.id).appendingPathComponent("prefix/drive_c/users/player/Saved Games/Game/slot1.sav")
+        #expect(contents(kept) == "changed")
+    }
+
     @Test func aProfileBottleHasNoBestSetup() {
         let game = Game(id: "gta5", name: "GTA V Enhanced", executable: EngineProfile.gameFolder + "/GTA5_Enhanced.exe")
         let service = WineService(paths: PortnautPaths(root: URL(fileURLWithPath: "/tmp/portnaut-root")), metalShim: nil)
