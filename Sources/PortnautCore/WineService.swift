@@ -11,6 +11,9 @@ public final class WineService: @unchecked Sendable {
     public let paths: PortnautPaths
     /// Loaded into Wine processes; see Shims/PortnautMetalShim.m. nil outside Portnaut.app.
     public let metalShim: URL?
+    /// Called when one of a bottle's locks is held elsewhere, before waiting for it or refusing; tests see the
+    /// contention through it.
+    var lockContended: (@Sendable (BottleLockKind) -> Void)?
     public init(paths: PortnautPaths = PortnautPaths(), metalShim: URL? = WineService.bundledMetalShim) {
         self.paths = paths
         self.metalShim = metalShim
@@ -504,8 +507,10 @@ public final class WineService: @unchecked Sendable {
     public func prepareBottle(_ bottle: Bottle) async throws {
         let bottlePaths = paths.bottle(bottle)
         let fm = FileManager.default
-        let isNew = !bottlePaths.ready
         if let profile = bottle.engineProfile { try await prepareProfile(profile) }
+        let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
+        defer { gate.release() }
+        let isNew = !bottlePaths.ready
         if isNew {
             try fm.createDirectory(at: bottlePaths.prefix, withIntermediateDirectories: true)
             do {
@@ -648,7 +653,9 @@ public final class WineService: @unchecked Sendable {
     /// record changing, and the next start (requireEngine) or save repeats this, as every step can be repeated.
     /// A prefix already on its engine only gets the registry profile imported, also into a running session
     /// (settings apply to the next programs started; requireEngine imports again at each start).
-    func applyEngine(_ bottle: Bottle, saving: Bool = false) async throws {
+    /// The caller holds the bottle's gate; `session`, when given, is the bottle's session lock the caller holds
+    /// exclusive (a restore), otherwise an engine change takes it here.
+    func applyEngine(_ bottle: Bottle, saving: Bool = false, session: BottleLock? = nil) async throws {
         let bottlePaths = paths.bottle(bottle)
         let target = bottle.engineProfile
         if try engineInPlace(for: bottle) {
@@ -657,11 +664,13 @@ public final class WineService: @unchecked Sendable {
             return
         }
         // Changing the engine replaces files and values programs of a running session use, and the record may
-        // say applied only once the registry is on disk, which a running server keeps in memory. A program
-        // started outside Portnaut after this check is not seen; nothing can lock those out.
-        if try await serverRunning(for: bottle) {
-            throw PortnautError("Quit the Windows programs running in \(bottle.name) first, then try again.")
-        }
+        // say applied only once the registry is on disk, which a running server keeps in memory. A managed start
+        // holds the session from its engine check until its program has run; a program started outside Portnaut
+        // after the server check is not seen, as nothing can lock those out.
+        let busy = PortnautError("Quit the Windows programs running in \(bottle.name) first, then try again.")
+        guard let held = try session ?? tryLock(.session, of: bottle, exclusive: true) else { throw busy }
+        defer { if session == nil { held.release() } }
+        if try await serverRunning(for: bottle) { throw busy }
         // The files come from the profile build this Portnaut expects, recorded with its marker; checked before
         // anything changes, though every caller prepared or checked the profile already.
         if let target, !paths.profileReady(target) {
@@ -677,8 +686,8 @@ public final class WineService: @unchecked Sendable {
         if let other = previous.held, other != target, target != nil {
             var off = bottle
             off.engineProfile = nil
-            try await applyEngine(off)
-            return try await applyEngine(bottle, saving: saving)
+            try await applyEngine(off, session: held)
+            return try await applyEngine(bottle, saving: saving, session: held)
         }
         let leaving = previous.held.flatMap { $0 == target ? nil : $0 }
         // A backup left by a profile the record says was not applied, nor being applied, holds no originals.
@@ -706,6 +715,65 @@ public final class WineService: @unchecked Sendable {
     }
 
     static let engineStampValue = "EngineStamp"
+
+    /// A bottle's two locks, flock on files beside its prefix (a snapshot restore replaces the prefix), which
+    /// every Portnaut process on this root takes; always the gate first, then the session, then the library.
+    /// The gate (exclusive, waited for) is held by whatever reads the bottle's engine to act on it: a managed
+    /// start around requireEngine, update, prepareBottle and a snapshot restore. The session is held shared by
+    /// a managed start from before it lets the gate go until its program has run, and exclusive by an engine
+    /// change, which does not wait for it: a start whose Wine is not yet up shows in no server probe.
+    enum BottleLockKind: String, Sendable { case gate, session }
+
+    /// A held bottle lock; closing its file releases it.
+    final class BottleLock: @unchecked Sendable {
+        private let mutex = NSLock()
+        private var descriptor: Int32
+        init(descriptor: Int32) { self.descriptor = descriptor }
+        func release() {
+            mutex.lock()
+            defer { mutex.unlock() }
+            if descriptor >= 0 { close(descriptor); descriptor = -1 }
+        }
+        deinit { release() }
+    }
+
+    /// Takes one of the bottle's locks, waiting for it on a thread of its own (not the cooperative pool, where a
+    /// waiter could hold up the task that releases it).
+    func waitForLock(_ kind: BottleLockKind, of bottle: Bottle, exclusive: Bool) async throws -> BottleLock {
+        let (lock, descriptor) = try openLock(kind, of: bottle)
+        let operation = exclusive ? LOCK_EX : LOCK_SH
+        if flock(descriptor, operation | LOCK_NB) == 0 { return lock }
+        lockContended?(kind)
+        // flock returns EINTR for each signal caught while it waits; it is asked again then. The bound only
+        // keeps the loop finite: each pass needs another signal.
+        let error: Int32 = await withCheckedContinuation { done in
+            Thread.detachNewThread {
+                var error = EINTR, passes = 0
+                while error == EINTR, passes < 10_000 { error = flock(descriptor, operation) == 0 ? 0 : errno; passes += 1 }
+                done.resume(returning: error)
+            }
+        }
+        guard error == 0 else { throw PortnautError("Portnaut cannot lock \(bottle.name) (\(String(cString: strerror(error))))." ) }
+        return lock
+    }
+
+    /// Takes one of the bottle's locks if no one else holds it; nil when someone does.
+    func tryLock(_ kind: BottleLockKind, of bottle: Bottle, exclusive: Bool) throws -> BottleLock? {
+        let (lock, descriptor) = try openLock(kind, of: bottle)
+        if flock(descriptor, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0 { return lock }
+        guard errno == EWOULDBLOCK else { throw PortnautError("Portnaut cannot lock \(bottle.name) (\(String(cString: strerror(errno))))." ) }
+        lockContended?(kind)
+        return nil
+    }
+
+    private func openLock(_ kind: BottleLockKind, of bottle: Bottle) throws -> (BottleLock, Int32) {
+        try paths.createDirectories()
+        let file = paths.bottles.appendingPathComponent(".\(bottle.id).\(kind.rawValue).lock")
+        // O_CLOEXEC: a Wine started while the lock is held must not inherit it and keep it after the holder lets go.
+        let descriptor = open(file.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        guard descriptor >= 0 else { throw PortnautError("Portnaut cannot open \(bottle.name)’s lock (\(String(cString: strerror(errno))))." ) }
+        return (BottleLock(descriptor: descriptor), descriptor)
+    }
 
     /// Whether the record says the bottle's engine is applied, from its profile's current build, and drive Y:
     /// points at that engine.
@@ -829,6 +897,8 @@ public final class WineService: @unchecked Sendable {
         // A bottle switched to an engine profile gets it built (downloaded) before the switch is saved,
         // so a failed download leaves the bottle as it was; then its drive Y: moves to the profile.
         if let profile = bottle.engineProfile, paths.bottle(bottle).ready { try await prepareProfile(profile, progress: progress) }
+        let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
+        defer { gate.release() }
         let old = try? self.bottle(bottle.id).engineProfile
         guard paths.bottle(bottle).ready else { return try save(bottle) }
         // Other settings are saved first; an engine switch only once it has applied (applyEngine).
@@ -904,9 +974,14 @@ public final class WineService: @unchecked Sendable {
     /// and a failure to do so stops the start), the caller's bottle names that engine, so its Wine is the
     /// one the prefix is on, the saved settings' registry profile is imported (a save into a running session
     /// reaches the hives only if its server writes them, which a killed one never does, so each start imports
-    /// again; the import is repeatable), and a profile bottle's game has its arguments.
-    func requireEngine(of bottle: Bottle) async throws {
+    /// again; the import is repeatable), and a profile bottle's game has its arguments. All of it under the
+    /// bottle's gate; returns the bottle's session lock held shared, which the caller keeps until its program
+    /// has run, so no engine change comes between this check and that program.
+    @discardableResult
+    func requireEngine(of bottle: Bottle) async throws -> BottleLock {
         guard paths.runtimeReady, paths.bottle(bottle).ready else { throw PortnautError("Prepare Portnaut first.") }
+        let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
+        defer { gate.release() }
         let saved = try self.bottle(bottle.id)
         guard bottle.engineProfile == saved.engineProfile else { throw PortnautError("\(bottle.name)’s engine has changed since. Start the program again.") }
         if let profile = saved.engineProfile, !paths.profileReady(profile) {
@@ -914,16 +989,24 @@ public final class WineService: @unchecked Sendable {
         }
         try await applyEngine(saved)
         if saved.engineProfile != nil { try writeGameArguments(to: paths.bottle(saved)) }
+        // Only an engine change holds the session exclusive, and it holds the gate, which this start holds.
+        guard let session = try tryLock(.session, of: bottle, exclusive: false) else {
+            throw PortnautError("\(bottle.name) is being changed. Start the program again.")
+        }
+        return session
     }
 
     /// Runs a program of the bottle's drive and returns its exit code, by default after the whole session ends.
     @discardableResult
     func run(_ executable: URL, in bottle: Bottle, arguments: [String] = [], game: Game? = nil, waitForSession: Bool = true) async throws -> Int32 {
-        try await requireEngine(of: bottle)
+        let session = try await requireEngine(of: bottle)
+        defer { session.release() }
         let winPath = try paths.bottle(bottle).windowsPath(executable)
         guard FileManager.default.fileExists(atPath: executable.path) else { throw PortnautError("The Windows program could not be found. Use Locate game or reinstall it.") }
         let status = try await ProcessRunner.run(paths.wine(for: bottle), [winPath] + arguments, environment: environment(for: bottle, game: game),
                                                  directory: executable.deletingLastPathComponent(), log: paths.sessionLog, timeout: nil, allowFailure: true)
+        // Its program has run: whatever it left running keeps a Wine server up, which an engine change checks for.
+        session.release()
         // A launcher can exit while its child is still running. Track the entire prefix.
         if waitForSession { try await waitForSessionEnd(bottle) }
         return status
@@ -1113,9 +1196,11 @@ public final class WineService: @unchecked Sendable {
 
     /// Wine's Game Controllers panel, which lists and tests controllers as Windows programs see them.
     public func openControllerPanel(_ bottle: Bottle, waitForSession: Bool = true) async throws {
-        try await requireEngine(of: bottle)
+        let session = try await requireEngine(of: bottle)
+        defer { session.release() }
         try await ProcessRunner.run(paths.wine(for: bottle), ["control", "joy.cpl"], environment: environment(for: bottle),
                                     directory: paths.bottle(bottle).drive, log: paths.sessionLog, timeout: nil, allowFailure: true)
+        session.release()
         if waitForSession { try await waitForSessionEnd(bottle) }
     }
 
@@ -1222,7 +1307,8 @@ public final class WineService: @unchecked Sendable {
     /// it added. With `waitForSession` false, as when the bottle's launcher is open, Portnaut waits
     /// only for the installer's own process.
     public func runInstaller(_ file: URL, in bottle: Bottle, arguments: [String] = [], waitForSession: Bool = true) async throws -> [DetectedProgram] {
-        try await requireEngine(of: bottle)
+        let session = try await requireEngine(of: bottle)
+        defer { session.release() }
         let kind = file.pathExtension.lowercased()
         guard kind == "msi" || (kind == "exe" && (try? PEImage.wineArchitecture(of: file)) != nil) else {
             throw PortnautError("\(file.lastPathComponent) is not a Windows installer. Choose an .exe or .msi file.")
@@ -1238,6 +1324,7 @@ public final class WineService: @unchecked Sendable {
         let status = try await ProcessRunner.run(paths.wine(for: bottle), (kind == "msi" ? ["msiexec", "/i", windowsFile] : [windowsFile]) + arguments,
                                                  environment: environment(for: bottle), directory: file.deletingLastPathComponent(),
                                                  log: paths.sessionLog, timeout: nil, allowFailure: true)
+        session.release()
         if waitForSession { try await waitForSessionEnd(bottle) }
         // Installing a launcher into a bottle without one makes it that launcher's bottle.
         var current = try self.bottle(bottle.id)

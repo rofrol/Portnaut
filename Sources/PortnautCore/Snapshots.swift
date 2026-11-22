@@ -105,7 +105,14 @@ extension WineService {
         let source = paths.snapshots(of: bottle).appendingPathComponent(snapshot.id).appendingPathComponent("prefix")
         guard fm.fileExists(atPath: source.path) else { throw PortnautError("That snapshot is no longer in Portnaut’s data folder.") }
         if let profile = snapshot.bottle.engineProfile { try await prepareProfile(profile, progress: progress) }
+        let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
+        defer { gate.release() }
         try? await stop(bottle)
+        // The prefix is replaced only once every managed start's program has exited, which stopping the bottle
+        // makes them do; a start that had checked the engine but not yet started its program starts it after
+        // the stop, and the restore waits for that program too.
+        let session = try await waitForLock(.session, of: bottle, exclusive: true)
+        defer { session.release() }
         let prefix = paths.bottle(bottle).prefix
         if fm.fileExists(atPath: prefix.path) {
             try takeSnapshot(of: bottle, label: "Before restoring “\(snapshot.label)”", automatic: true)
@@ -124,7 +131,7 @@ extension WineService {
         // The snapshot's drive Y: may point at the other engine; its files, registry and engine record are the snapshot's own.
         let engineReady = restored.engineProfile.map { paths.profileReady($0) } ?? paths.runtimeReady
         guard paths.bottle(restored).ready, engineReady else { return }
-        try await applyEngine(restored)
+        try await applyEngine(restored, session: session)
     }
 
     /// Moves a snapshot to the Trash.

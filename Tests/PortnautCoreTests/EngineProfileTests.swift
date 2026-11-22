@@ -503,6 +503,131 @@ struct EngineProfileTests {
         #expect(FileManager.default.fileExists(atPath: profile.path))
     }
 
+    /// A managed start holds the bottle from its engine check until its program has run: an engine switch from
+    /// elsewhere (another task here; the app and portnaut-doctor are separate processes) waits for the start's
+    /// check and import (the gate), then refuses while the start's program may still be starting or running
+    /// (the session). So a start never imports the leaving engine's values over a switch, nor runs the old Wine
+    /// on a switched prefix.
+    @Test func anEngineSwitchWaitsForAStartInProgress() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try fakeRuntime(service)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try await service.update(bottle)
+        // The bottle's Wine stops, once armed, in a start's `reg import` (armed-reg) or in the program it runs
+        // (armed-run) until the test lets it go, after telling the test it got there.
+        let hold = root.appendingPathComponent("hold")
+        try FileManager.default.createDirectory(at: hold, withIntermediateDirectories: true)
+        for fifo in ["reached", "release"] { #expect(mkfifo(hold.appendingPathComponent(fifo).path, 0o600) == 0) }
+        let wine = service.paths.wine(for: bottle)
+        try FileManager.default.moveItem(at: wine, to: hold.appendingPathComponent("wine"))
+        let script = "#!/bin/sh\nH='\(hold.path)'\n"
+            + "case \"$1\" in reg) step=reg ;; wineboot|cmd) step= ;; *) step=run ;; esac\n"
+            + "if [ -n \"$step\" ] && [ -e \"$H/armed-$step\" ]; then rm \"$H/armed-$step\"; echo reached > \"$H/reached\"; read go < \"$H/release\"; fi\n"
+            + "exec \"$H/wine\" \"$@\"\n"
+        try Data(script.utf8).write(to: wine)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wine.path)
+        let reached = hold.appendingPathComponent("reached").path, release = hold.appendingPathComponent("release").path
+        let contentions = Recorded()
+        let first = FirstEvent()
+        service.lockContended = { kind in contentions.append(kind.rawValue); first.signal("contended \(kind.rawValue)") }
+        var switched = bottle
+        switched.engineProfile = .gta5Enhanced
+
+        try Data().write(to: hold.appendingPathComponent("armed-reg"))
+        let start = Task { try await service.requireEngine(of: bottle) }
+        await arrival(at: reached, of: start)
+        // The switch either finds the start's lock held, or runs to its end without waiting for the start.
+        let change = Task {
+            defer { first.signal("switch ended") }
+            try await service.update(switched)
+        }
+        #expect(await first.value == "contended gate")
+        await onThread { FileHandle(forWritingAtPath: release).map { $0.write(Data("go\n".utf8)); $0.closeFile() } }
+        let session = try await start.value
+        let refused = await #expect(throws: PortnautError.self) { try await change.value }
+        #expect(refused?.message.hasPrefix("Quit the Windows programs") == true)
+        #expect(contentions.values == ["gate", "session"])
+        #expect(try service.engineState(in: bottlePaths) == .applied(nil, marker: nil))
+        #expect(try service.bottle(bottle.id).engineProfile == nil)
+        session.release()
+
+        // A start through run holds the session while its program runs.
+        let program = bottlePaths.drive.appendingPathComponent("game.exe")
+        try Data().write(to: program)
+        try Data().write(to: hold.appendingPathComponent("armed-run"))
+        let launch = Task { try await service.run(program, in: bottle, waitForSession: false) }
+        await arrival(at: reached, of: launch)
+        let busy = await #expect(throws: PortnautError.self) { try await service.update(switched) }
+        #expect(busy?.message.hasPrefix("Quit the Windows programs") == true)
+        await onThread { FileHandle(forWritingAtPath: release).map { $0.write(Data("go\n".utf8)); $0.closeFile() } }
+        _ = try await launch.value
+        #expect(try service.engineState(in: bottlePaths) == .applied(nil, marker: nil))
+
+        // Once the start's program has run, the switch goes through.
+        try await service.update(switched)
+        #expect(try service.engineState(in: bottlePaths) == .applied(.gta5Enhanced, marker: EngineProfile.gta5Enhanced.marker))
+    }
+
+    /// Waits until the armed Wine reports, through the FIFO at `reached`, that it got to its stop; a `task`
+    /// that fails before that writes to the FIFO itself, so the wait ends and the test fails on the task.
+    func arrival<T: Sendable>(at reached: String, of task: Task<T, any Error>) async {
+        let watcher = Task {
+            if case .failure = await task.result {
+                await onThread { FileHandle(forWritingAtPath: reached).map { $0.write(Data("failed\n".utf8)); $0.closeFile() } }
+            }
+        }
+        let report = Recorded()
+        await onThread { report.append(String(decoding: FileHandle(forReadingAtPath: reached)?.readDataToEndOfFile() ?? Data(), as: UTF8.self)) }
+        #expect(report.values == ["reached\n"], "the task ended before its Wine reached the stop")
+        _ = watcher
+    }
+
+    /// Values appended from any thread.
+    final class Recorded: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [String] = []
+        func append(_ value: String) { lock.lock(); stored.append(value); lock.unlock() }
+        var values: [String] { lock.lock(); defer { lock.unlock() }; return stored }
+    }
+
+    /// Runs blocking work (a FIFO's open, which waits for the other end; FileHandle opens it so, String(contentsOf:)
+    /// does not) on a thread of its own, off the cooperative pool.
+    func onThread(_ body: @escaping @Sendable () -> Void) async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            Thread.detachNewThread { body(); done.resume() }
+        }
+    }
+
+    /// The first of several events to happen; later ones are ignored.
+    final class FirstEvent: @unchecked Sendable {
+        private let lock = NSLock()
+        private var event: String?
+        private var waiter: CheckedContinuation<String, Never>?
+        func signal(_ name: String) {
+            lock.lock()
+            guard event == nil else { return lock.unlock() }
+            event = name
+            let waiting = waiter
+            waiter = nil
+            lock.unlock()
+            waiting?.resume(returning: name)
+        }
+        var value: String {
+            get async {
+                await withCheckedContinuation { continuation in
+                    lock.lock()
+                    if let event { lock.unlock(); continuation.resume(returning: event) } else { waiter = continuation; lock.unlock() }
+                }
+            }
+        }
+    }
+
     /// Where a switch can fail part-way, and how to make it fail there and undo that.
     enum SwitchFailure: CaseIterable {
         case driveY, files, registry, save
