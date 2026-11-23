@@ -166,7 +166,8 @@ public enum EngineProfile: String, Codable, CaseIterable, Sendable, Identifiable
         env["D3DM_ENABLE_METALFX"] = "0"
         // Read by the gta5 overlay's patches: Social Club's browser draws on the CPU.
         env["GTM_ROCKSTAR_SWIFTSHADER"] = "1"
-        // The Windows user MacGames' engine expects; the launcher signs in as it.
+        // The Windows user MacGames' engine expects; the launcher signs in as it. Only for a prefix without a user
+        // yet: WineService.environment runs a prefix's programs as its own user (windowsUser) on every engine.
         env["USER"] = "crossover"
         env["LOGNAME"] = "crossover"
         return env

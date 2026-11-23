@@ -190,12 +190,14 @@ struct EngineProfileTests {
     /// them to `savedHives`, as Wine's server writes each hive on exit (none: a server killed first). `-k0`
     /// exits with `probeStatus` (0: a server runs, 1: none). With `calls`, each run appends a line there: its first
     /// argument and whether each of `probeLocks` was held then (`held`, `free`, `missing`, or `error` when flock
-    /// failed otherwise).
+    /// failed otherwise). With `users`, each run appends its first argument, USER and LOGNAME there; wineboot also
+    /// sets up USER's folder in drive_c/users, as Wine does for a user the prefix has not seen.
     func fakeWine(_ url: URL, exitCode: Int = 0, failing: String? = nil, savedHives: [String] = ["user.reg", "system.reg"], probeStatus: Int = 1,
-                  calls: URL? = nil, probeLocks: [URL] = []) throws {
+                  calls: URL? = nil, probeLocks: [URL] = [], users: URL? = nil) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // wineboot creates the folders prepareBottle's later steps use.
         let wineboot = "[ \"$1\" = wineboot ] && mkdir -p \"$WINEPREFIX/dosdevices\" \"$WINEPREFIX/drive_c/windows/system32\"\n"
+            + (users == nil ? "" : "[ \"$1\" = wineboot ] && mkdir -p \"$WINEPREFIX/drive_c/users/$USER\"\n")
         let failure = failing.map { "[ \"$1\" = \($0) ] && exit 1\n" } ?? ""
         let probe = "[ \"$1\" = -k0 ] && exit \(probeStatus)\n"
         let profile = "\"$WINEPREFIX/drive_c/Portnaut/profile.reg\""
@@ -207,7 +209,8 @@ struct EngineProfileTests {
         let lockStates = #"perl -MFcntl=:flock -e 'for (@ARGV) { if (open(my $f, "<", $_)) { print flock($f, LOCK_SH | LOCK_NB) ? " free" : $!{EWOULDBLOCK} ? " held" : " error" } else { print " missing" } }'"#
             + probeLocks.map { " '\($0.path)'" }.joined()
         let record = calls.map { "{ printf %s \"$1\"; \(lockStates); echo; } >> '\($0.path)'\n" } ?? ""
-        try Data("#!/bin/sh\n\(record)\(wineboot)\(probe)\(failure)\(registry)exit \(exitCode)\n".utf8).write(to: url)
+        let user = users.map { "echo \"$1 $USER $LOGNAME\" >> '\($0.path)'\n" } ?? ""
+        try Data("#!/bin/sh\n\(record)\(user)\(wineboot)\(probe)\(failure)\(registry)exit \(exitCode)\n".utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
     func fakeRuntime(_ service: WineService) throws {
@@ -580,6 +583,186 @@ struct EngineProfileTests {
         try FileManager.default.removeItem(at: profile)
         await #expect(throws: (any Error).self) { try await service.requireEngine(of: bottle) }
         #expect(FileManager.default.fileExists(atPath: profile.path))
+    }
+
+    // MARK: - Windows user
+
+    /// A Portnaut runtime and profile whose Wine records each run's USER and LOGNAME in the returned file.
+    func fakeEnginesRecordingUsers(_ root: URL, _ service: WineService) throws -> URL {
+        let users = root.appendingPathComponent("users.log")
+        for renderer in Renderer.allCases {
+            try fakeWine(service.paths.wine(for: renderer), users: users)
+            try fakeWine(service.paths.wineserver(for: renderer))
+        }
+        try fakeWine(service.paths.profile(.gta5Enhanced).engine.appendingPathComponent("bin/wine"), users: users)
+        try Data().write(to: service.paths.runtimeMarker)
+        try FileManager.default.createDirectory(at: service.paths.libraries, withIntermediateDirectories: true)
+        try Data().write(to: service.paths.libraries.appendingPathComponent("libinotify.0.dylib"))
+        return users
+    }
+    func userFolders(_ bottlePaths: BottlePaths) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: bottlePaths.drive.appendingPathComponent("users").path)) ?? []).sorted()
+    }
+
+    /// A bottle born on either engine and switched to the other and back runs every Wine of both as the Windows user
+    /// it was born with (crossover on the profile, the Mac user on Portnaut's Wine), so its programs' data stays in
+    /// the one user folder it has.
+    @Test(arguments: [nil, .gta5Enhanced] as [EngineProfile?])
+    func aBottleRunsAsTheUserItWasBornWithOnEveryEngine(born: EngineProfile?) async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let users = try fakeEnginesRecordingUsers(root, service)
+        let macUser = try #require(ProcessInfo.processInfo.environment["USER"])
+        #expect(macUser != "crossover")
+        let expected = born == nil ? macUser : "crossover"
+        var bottle = try await service.createBottle(name: "Rockstar Games Launcher", launcher: .rockstar, renderer: .dxmt, engineProfile: born)
+        let bottlePaths = service.paths.bottle(bottle)
+        #expect(contents(service.windowsUserFile(in: bottlePaths)) == expected + "\n")
+        for profile in [born == nil ? .gta5Enhanced : nil, born] {
+            bottle.engineProfile = profile
+            try await service.update(bottle)
+            #expect(try service.bottle(bottle.id).engineProfile == profile)
+            try await service.requireEngine(of: bottle)
+            #expect(service.environment(for: bottle)["USER"] == expected)
+        }
+        let runs = (contents(users) ?? "").split(separator: "\n").map { $0.split(separator: " ").map(String.init) }
+        // wineboot, then each engine's registry imports.
+        #expect(runs.count >= 5)
+        #expect(runs.first?.first == "wineboot")
+        for run in runs { #expect(Array(run.dropFirst()) == [expected, expected], "\(run)") }
+        #expect(userFolders(bottlePaths) == [expected])
+    }
+
+    /// A prefix from before pins with one user folder is pinned to it at its next start, whatever its engine's user.
+    @Test func aStartPinsThePrefixsOnlyUser() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let users = try fakeEnginesRecordingUsers(root, service)
+        let bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        for name in ["alice", "Public", ".hidden"] {
+            try FileManager.default.createDirectory(at: bottlePaths.drive.appendingPathComponent("users/\(name)"), withIntermediateDirectories: true)
+        }
+        try Data().write(to: bottlePaths.drive.appendingPathComponent("users/notes.txt"))
+        #expect(service.environment(for: bottle)["LOGNAME"] == "alice")
+        try await service.requireEngine(of: bottle)
+        #expect(contents(service.windowsUserFile(in: bottlePaths)) == "alice\n")
+        #expect(contents(users)?.split(separator: "\n").allSatisfy { $0.hasSuffix(" alice alice") } == true)
+    }
+
+    /// A prefix with several user folders and no pin (switched between engines before pins existed) is refused
+    /// before any Wine runs in it, until the user pins one; a pin that is not a single name is refused too.
+    @Test func aPrefixWhoseUserCannotBeToldIsRefused() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let users = try fakeEnginesRecordingUsers(root, service)
+        var bottle = gtaBottle()
+        bottle.engineProfile = nil
+        let bottlePaths = try readyBottle(bottle, in: service)
+        for name in ["crossover", "romanfrolow"] {
+            try FileManager.default.createDirectory(at: bottlePaths.drive.appendingPathComponent("users/\(name)"), withIntermediateDirectories: true)
+        }
+        let pin = service.windowsUserFile(in: bottlePaths)
+        try await expectRefusal(naming: "crossover, romanfrolow") { try await service.requireEngine(of: bottle) }
+        bottle.engineProfile = .gta5Enhanced
+        try await expectRefusal(naming: "crossover, romanfrolow") { try await service.update(bottle) }
+        #expect(try service.bottle(bottle.id).engineProfile == nil)
+        #expect(!FileManager.default.fileExists(atPath: pin.path))
+        #expect(try service.engineState(in: bottlePaths) == nil)
+        #expect(contents(users) == nil)
+        try FileManager.default.createDirectory(at: pin.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Each would run Wine as a user with empty folders: a typo, spaces, Public, two names, a path, a control.
+        for bad in ["", "\n", "\n\n", "crossvoer\n", " crossover\n", "crossover \n", "Public\n", "crossover\nromanfrolow\n",
+                    "crossover\r\n", "a/crossover", "..\n", "a\\crossover\n", "cross\u{0}over\n"] {
+            try Data(bad.utf8).write(to: pin)
+            try await expectRefusal(naming: "does not name one of") { try await service.update(bottle) }
+        }
+        #expect(contents(users) == nil)
+        try Data("crossover\n".utf8).write(to: pin)
+        try await service.update(bottle)
+        #expect(try service.bottle(bottle.id).engineProfile == .gta5Enhanced)
+        #expect(contents(users)?.split(separator: "\n").allSatisfy { $0.hasSuffix(" crossover crossover") } == true)
+    }
+
+    func expectRefusal(naming text: String, _ body: () async throws -> Void) async throws {
+        do {
+            try await body()
+            Issue.record("no refusal")
+        } catch let error as PortnautError {
+            #expect(error.message.contains(text), "\(error.message)")
+        }
+    }
+
+    /// A pin that is not one name is refused also while the prefix has no user folder to check it against, and a
+    /// prefix's only user folder is not pinned when its name is not one.
+    @Test func aPinOrFolderThatIsNotOneNameIsRefused() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let users = try fakeEnginesRecordingUsers(root, service)
+        let bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let pin = service.windowsUserFile(in: bottlePaths)
+        try FileManager.default.createDirectory(at: pin.deletingLastPathComponent(), withIntermediateDirectories: true)
+        for bad in ["", " alice\n", "Public\n", "alice\nbob\n", "a/alice", ".alice\n", "al\u{0}ice\n", "al\tice\n", "a\\alice\n"] {
+            try Data(bad.utf8).write(to: pin)
+            try await expectRefusal(naming: "does not name one of") { try await service.requireEngine(of: bottle) }
+        }
+        try FileManager.default.removeItem(at: pin)
+        try FileManager.default.createDirectory(at: bottlePaths.drive.appendingPathComponent("users/alice "), withIntermediateDirectories: true)
+        try await expectRefusal(naming: "is not a name") { try await service.requireEngine(of: bottle) }
+        #expect(!FileManager.default.fileExists(atPath: pin.path))
+        #expect(contents(users) == nil)
+    }
+
+    /// A user folder that is a link to a folder elsewhere is the prefix's user; a lowercase public is not one; a link
+    /// that leads nowhere now (a volume not mounted) still counts, so the prefix's other folder is not taken for it.
+    @Test func aLinkedUserFolderIsThePrefixsUser() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try fakeEnginesRecordingUsers(root, service)
+        let bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        let users = bottlePaths.drive.appendingPathComponent("users")
+        let elsewhere = root.appendingPathComponent("elsewhere/alice")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: users.appendingPathComponent("public"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: users.appendingPathComponent("alice"), withDestinationURL: elsewhere)
+        try await service.requireEngine(of: bottle)
+        #expect(contents(service.windowsUserFile(in: bottlePaths)) == "alice\n")
+
+        var other = Bottle(id: "other", name: "Other", launcher: .rockstar, renderer: .d3dmetal)
+        other.engineProfile = .gta5Enhanced
+        let otherPaths = try readyBottle(other, in: service)
+        let otherUsers = otherPaths.drive.appendingPathComponent("users")
+        try FileManager.default.createDirectory(at: otherUsers.appendingPathComponent("crossover"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: otherUsers.appendingPathComponent("bob"), withDestinationURL: root.appendingPathComponent("unmounted/bob"))
+        // A link to a file is no user's folder, so the refusal does not list it.
+        let notes = root.appendingPathComponent("notes.txt")
+        try Data().write(to: notes)
+        try FileManager.default.createSymbolicLink(at: otherUsers.appendingPathComponent("notes"), withDestinationURL: notes)
+        try await expectRefusal(naming: "folders for bob, crossover, and") { try await service.requireEngine(of: other) }
+        #expect(!FileManager.default.fileExists(atPath: service.windowsUserFile(in: otherPaths).path))
+    }
+
+    /// The pin outlasts a user the bottle's own variables set: Wine sets up that user's folder while the variable
+    /// applies, and once it is gone the bottle runs as its pinned user again instead of being refused.
+    @Test func aUserSetInTheBottlesVariablesLeavesThePinnedOne() async throws {
+        let (root, service) = try scratchRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try fakeEnginesRecordingUsers(root, service)
+        var bottle = gtaBottle()
+        let bottlePaths = try readyBottle(bottle, in: service)
+        try FileManager.default.createDirectory(at: bottlePaths.drive.appendingPathComponent("users/alice"), withIntermediateDirectories: true)
+        try await service.requireEngine(of: bottle)
+        bottle.environment = ["USER": "tester"]
+        try await service.update(bottle)
+        #expect(service.environment(for: bottle)["USER"] == "tester")
+        try FileManager.default.createDirectory(at: bottlePaths.drive.appendingPathComponent("users/tester"), withIntermediateDirectories: true)
+        bottle.environment = [:]
+        try await service.update(bottle)
+        try await service.requireEngine(of: bottle)
+        #expect(service.environment(for: bottle)["USER"] == "alice")
+        #expect(contents(service.windowsUserFile(in: bottlePaths)) == "alice\n")
     }
 
     /// A managed start holds the bottle from its engine check until its program has run: an engine switch from

@@ -50,6 +50,13 @@ public final class WineService: @unchecked Sendable {
         } else {
             env = rendererEnvironment(for: bottle, base: env)
         }
+        // Wine names the Windows user after USER (init_paths in dlls/ntdll/unix/loader.c), so every engine runs as
+        // the prefix's own user; a prefix that has none yet (or cannot tell, which a gated start refuses) gets
+        // its engine's: crossover on the profile, the Mac user on Portnaut's Wine.
+        if let user = try? windowsUser(in: paths.bottle(bottle)) {
+            env["USER"] = user
+            env["LOGNAME"] = user
+        }
         // The user's own variables last, so they can adjust Portnaut's (not the ones that keep the bottle apart).
         for (key, value) in bottle.environment.merging(game?.environment ?? [:], uniquingKeysWith: { $1 }) where EnvironmentPolicy.allows(key) { env[key] = value }
         return env
@@ -516,6 +523,8 @@ public final class WineService: @unchecked Sendable {
         let gate = try await waitForLock(.gate, of: bottle, exclusive: true)
         defer { gate.release() }
         try recoverRestore(of: bottle)
+        // Before wineboot, which a half-prepared prefix runs again (applyEngine pins it too).
+        try pinWindowsUser(in: bottlePaths)
         let isNew = !bottlePaths.ready
         if isNew {
             try fm.createDirectory(at: bottlePaths.prefix, withIntermediateDirectories: true)
@@ -666,10 +675,12 @@ public final class WineService: @unchecked Sendable {
     /// A prefix already on its engine only gets the registry profile imported, also into a running session
     /// (settings apply to the next programs started; requireEngine imports again at each start).
     /// The caller holds the bottle's gate; `session`, when given, is the bottle's session lock the caller holds
-    /// exclusive (a restore), otherwise an engine change takes it here.
+    /// exclusive (a restore), otherwise an engine change takes it here. First the prefix's Windows user is pinned
+    /// (pinWindowsUser), and a prefix whose user cannot be told is refused before any engine runs in it.
     func applyEngine(_ bottle: Bottle, saving: Bool = false, session: BottleLock? = nil) async throws {
         let bottlePaths = paths.bottle(bottle)
         let target = bottle.engineProfile
+        try pinWindowsUser(in: bottlePaths)
         if try engineInPlace(for: bottle) {
             try await importProfile(of: bottle)
             if saving { try save(bottle) }
@@ -969,6 +980,72 @@ public final class WineService: @unchecked Sendable {
         }
     }
     func engineStateFile(in bottlePaths: BottlePaths) -> URL { bottlePaths.drive.appendingPathComponent("Portnaut/engine-state.json") }
+
+    /// The Windows user the prefix's programs run as on every engine: the name pinned in
+    /// drive_c/Portnaut/windows-user, otherwise the only user folder in drive_c/users (Public and dot-names aside),
+    /// which the prefix's first Wine run made; nil while there is none. A user's folders hold its programs' data
+    /// (Documents, AppData, Saved Games, TEMP), and Wine sets up a new user with empty folders for a USER the prefix
+    /// has not seen, so an engine running as another user would hide that data. Throws for a pin that cannot be read,
+    /// is not one name, or names no user folder the prefix has (once it has one), and for several user folders
+    /// without a pin (a prefix switched between engines before pins existed): which one holds the data is the
+    /// user's to say.
+    func windowsUser(in bottlePaths: BottlePaths) throws -> String? {
+        let fm = FileManager.default
+        let users = bottlePaths.drive.appendingPathComponent("users")
+        var folders: [String] = []
+        if fm.fileExists(atPath: users.path) {
+            // A folder counts, also through a link; so does a link that leads nowhere now: one to a volume not
+            // mounted may be the user's folder, which must not be passed over for another.
+            folders = try fm.contentsOfDirectory(atPath: users.path).filter { name in
+                let path = users.appendingPathComponent(name).path
+                var isFolder: ObjCBool = false
+                guard !name.hasPrefix("."), name.caseInsensitiveCompare("Public") != .orderedSame else { return false }
+                return fm.fileExists(atPath: path, isDirectory: &isFolder)
+                    ? isFolder.boolValue : (try? fm.destinationOfSymbolicLink(atPath: path)) != nil
+            }.sorted()
+        }
+        let pin = windowsUserFile(in: bottlePaths)
+        let pinned: String?
+        do { pinned = try String(contentsOf: pin, encoding: .utf8) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { pinned = nil }
+        catch { throw PortnautError("Portnaut cannot read the Windows user of \(bottlePaths.prefix.lastPathComponent) from \(pin.path): \(error.localizedDescription)") }
+        if let pinned {
+            let name = pinned.hasSuffix("\n") ? String(pinned.dropLast()) : pinned
+            guard Self.isWindowsUserName(name), folders.isEmpty || folders.contains(name) else {
+                throw PortnautError("\(pin.path) does not name one of \(bottlePaths.prefix.lastPathComponent)’s Windows users (\(folders.isEmpty ? "it has none yet" : folders.joined(separator: ", "))). Write the user’s name there, alone on one line.")
+            }
+            return name
+        }
+        guard folders.count <= 1 else {
+            throw PortnautError("\(bottlePaths.prefix.lastPathComponent) has Windows user folders for \(folders.joined(separator: ", ")), and Portnaut cannot tell which one its programs keep their data in. Write that user’s name into \(pin.path), alone on one line, then try again.")
+        }
+        if let only = folders.first, !Self.isWindowsUserName(only) {
+            throw PortnautError("\(bottlePaths.prefix.lastPathComponent)’s Windows user folder \(only.debugDescription) is not a name Portnaut can run its programs as.")
+        }
+        return folders.first
+    }
+
+    /// A name Wine keeps whole as the Windows user (it drops what comes before a / or a backslash), with no control
+    /// characters, no spaces around it, not hidden (a dot first, which windowsUser does not count as a user), and
+    /// not Public, the folder every user shares.
+    static func isWindowsUserName(_ name: String) -> Bool {
+        !name.isEmpty && !name.hasPrefix(".") && name.caseInsensitiveCompare("Public") != .orderedSame
+            && name.trimmingCharacters(in: .whitespacesAndNewlines) == name
+            && !name.unicodeScalars.contains { $0 == "/" || $0 == "\\" || CharacterSet.controlCharacters.contains($0) || CharacterSet.newlines.contains($0) }
+    }
+
+    /// Pins windowsUser once the prefix has one, so it stays the user even after Wine sets up another (a USER in the
+    /// bottle's own variables, which still applies while it is set). The caller holds the bottle's gate and runs
+    /// this before Wine changes engine. Written whole but not synced: a pin lost to power loss is pinned again from
+    /// the same single folder, or refused if a second one appeared since.
+    func pinWindowsUser(in bottlePaths: BottlePaths) throws {
+        guard let user = try windowsUser(in: bottlePaths) else { return }
+        let file = windowsUserFile(in: bottlePaths)
+        guard !FileManager.default.fileExists(atPath: file.path) else { return }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data((user + "\n").utf8).write(to: file, options: .atomic)
+    }
+    func windowsUserFile(in bottlePaths: BottlePaths) -> URL { bottlePaths.drive.appendingPathComponent("Portnaut/windows-user") }
 
     /// Where the system32 files an engine profile replaced are kept while the bottle uses it.
     func engineBackup(of profile: EngineProfile, in bottlePaths: BottlePaths) -> URL {
