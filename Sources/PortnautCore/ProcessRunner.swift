@@ -21,24 +21,48 @@ public enum ProcessRunner {
             process.standardOutput = handle
             process.standardError = handle
             process.standardInput = FileHandle.nullDevice
-            try process.run()
-            let start = Date()
-            while process.isRunning {
-                if let timeout, Date().timeIntervalSince(start) > timeout {
-                    process.terminate()
-                    try? await Task.sleep(for: .milliseconds(300))
-                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                    throw PortnautError("\(executable.lastPathComponent) took too long. Open Diagnostics for the log, then retry.")
+            // The wait ends on Foundation's exit callback, not on re-checking
+            // isRunning. waitUntilExit is not used: it runs the current thread's
+            // run loop, which can hang when an async task resumes on another thread.
+            enum Event { case exited(Int32), timedOut, graceOver }
+            let (events, sink) = AsyncStream.makeStream(of: Event.self)
+            process.terminationHandler = { sink.yield(.exited($0.terminationStatus)) }
+            var deadlines: [Task<Void, Never>] = []
+            defer {
+                deadlines.forEach { $0.cancel() }
+                sink.finish()
+            }
+            func send(_ event: Event, at deadline: ContinuousClock.Instant) -> Task<Void, Never> {
+                Task {
+                    do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+                    sink.yield(event)
                 }
-                try? await Task.sleep(for: .milliseconds(100))
             }
-            // isRunning becomes false after Foundation records the exit status.
-            // waitUntilExit uses a thread-local run loop and can hang when an
-            // async task resumes on a different thread from process.run().
-            guard allowFailure || process.terminationStatus == 0 else {
-                throw PortnautError("\(executable.lastPathComponent) exited with code \(process.terminationStatus). See \(log.lastPathComponent) in Diagnostics for details.")
+            try process.run()
+            if let timeout { deadlines.append(send(.timedOut, at: .now + .seconds(timeout))) }
+            var timedOut = false
+            let tooLong = PortnautError("\(executable.lastPathComponent) took too long. Open Diagnostics for the log, then retry.")
+            for await event in events {
+                switch event {
+                case .exited(let status):
+                    if timedOut { throw tooLong }
+                    guard allowFailure || status == 0 else {
+                        throw PortnautError("\(executable.lastPathComponent) exited with code \(status). See \(log.lastPathComponent) in Diagnostics for details.")
+                    }
+                    return status
+                case .timedOut:
+                    // Already ended: its .exited follows and counts as a normal exit.
+                    guard process.isRunning else { continue }
+                    timedOut = true
+                    process.terminate()
+                    deadlines.append(send(.graceOver, at: .now + .milliseconds(300)))
+                case .graceOver:
+                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                    throw tooLong
+                }
             }
-            return process.terminationStatus
+            // Only cancelling this task ends the stream early, and nothing holds it to cancel it.
+            preconditionFailure("The exit events of \(executable.lastPathComponent) ended before its exit")
         }.value
     }
 }

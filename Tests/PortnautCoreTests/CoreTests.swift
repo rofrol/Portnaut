@@ -1238,4 +1238,12 @@ final class CoreTests {
         }
         #expect(Date().timeIntervalSince(start) < 3)
     }
+    @Test func testRunnerReturnsTheExitStatus() async throws {
+        let log = root.appendingPathComponent("exit.log")
+        #expect(try await ProcessRunner.run(URL(fileURLWithPath: "/usr/bin/true"), [], log: log) == 0)
+        #expect(try await ProcessRunner.run(URL(fileURLWithPath: "/bin/sh"), ["-c", "exit 7"], log: log, allowFailure: true) == 7)
+        await #expect(throws: (any Error).self) {
+            try await ProcessRunner.run(self.root.appendingPathComponent("no-such-program"), [], log: log)
+        }
+    }
 }
